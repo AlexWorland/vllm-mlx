@@ -1913,19 +1913,28 @@ async def _stream_anthropic_messages(
     }
     yield f"event: message_start\ndata: {json.dumps(message_start)}\n\n"
 
-    # Emit content_block_start for text
-    content_block_start = {
-        "type": "content_block_start",
-        "index": 0,
-        "content_block": {"type": "text", "text": ""},
-    }
-    yield f"event: content_block_start\ndata: {json.dumps(content_block_start)}\n\n"
-
-    # Stream content deltas
+    # Stream content deltas with optional thinking block separation
     accumulated_text = ""
     completion_tokens = 0
     prompt_tokens = 0
     first_token_time = None
+
+    # Reasoning parser state
+    use_reasoning = _reasoning_parser is not None
+    thinking_block_started = False
+    text_block_started = False
+    block_index = 0
+    parser_prev_text = ""
+
+    if not use_reasoning:
+        # No reasoning parser — emit text block upfront (original behavior)
+        cb_start = {
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {"type": "text", "text": ""},
+        }
+        yield f"event: content_block_start\ndata: {json.dumps(cb_start)}\n\n"
+        text_block_started = True
 
     async for output in engine.stream_chat(messages=messages, **chat_kwargs):
         delta_text = output.new_text
@@ -1940,29 +1949,92 @@ async def _stream_anthropic_messages(
         if hasattr(output, "completion_tokens") and output.completion_tokens:
             completion_tokens = output.completion_tokens
 
-        if delta_text:
-            # Filter special tokens
-            content = SPECIAL_TOKENS_PATTERN.sub("", delta_text)
+        if not delta_text:
+            continue
 
-            if content:
-                accumulated_text += content
-                delta_event = {
+        # Filter special tokens
+        content = SPECIAL_TOKENS_PATTERN.sub("", delta_text)
+        if not content:
+            continue
+
+        accumulated_text += content
+
+        if use_reasoning:
+            parser_cur_text = parser_prev_text + content
+            delta_msg = _reasoning_parser.extract_reasoning_streaming(
+                parser_prev_text, parser_cur_text, content
+            )
+            parser_prev_text = parser_cur_text
+
+            if delta_msg is None:
+                continue
+
+            # Emit reasoning delta into thinking block
+            if delta_msg.reasoning:
+                if not thinking_block_started:
+                    tb_start = {
+                        "type": "content_block_start",
+                        "index": block_index,
+                        "content_block": {"type": "thinking", "thinking": ""},
+                    }
+                    yield f"event: content_block_start\ndata: {json.dumps(tb_start)}\n\n"
+                    thinking_block_started = True
+                td = {
                     "type": "content_block_delta",
-                    "index": 0,
-                    "delta": {"type": "text_delta", "text": content},
+                    "index": block_index,
+                    "delta": {"type": "thinking_delta", "thinking": delta_msg.reasoning},
                 }
-                yield f"event: content_block_delta\ndata: {json.dumps(delta_event)}\n\n"
+                yield f"event: content_block_delta\ndata: {json.dumps(td)}\n\n"
+
+            # Emit content delta into text block
+            if delta_msg.content:
+                if thinking_block_started and not text_block_started:
+                    # Close thinking block, advance index
+                    yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': block_index})}\n\n"
+                    block_index += 1
+                if not text_block_started:
+                    cb_start = {
+                        "type": "content_block_start",
+                        "index": block_index,
+                        "content_block": {"type": "text", "text": ""},
+                    }
+                    yield f"event: content_block_start\ndata: {json.dumps(cb_start)}\n\n"
+                    text_block_started = True
+                cd = {
+                    "type": "content_block_delta",
+                    "index": block_index,
+                    "delta": {"type": "text_delta", "text": delta_msg.content},
+                }
+                yield f"event: content_block_delta\ndata: {json.dumps(cd)}\n\n"
+        else:
+            # No reasoning parser — original behavior
+            delta_event = {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "text_delta", "text": content},
+            }
+            yield f"event: content_block_delta\ndata: {json.dumps(delta_event)}\n\n"
 
     # Check for tool calls in accumulated text
     _, tool_calls = _parse_tool_calls_with_parser(accumulated_text, openai_request)
 
-    # Emit content_block_stop for text block
-    yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': 0})}\n\n"
+    # Close any open blocks
+    if thinking_block_started and not text_block_started:
+        yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': block_index})}\n\n"
+        block_index += 1
+    if text_block_started:
+        yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': block_index})}\n\n"
+        block_index += 1
+    elif not thinking_block_started:
+        # No output at all — emit empty text block for protocol compliance
+        yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': block_index, 'content_block': {'type': 'text', 'text': ''}})}\n\n"
+        yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': block_index})}\n\n"
+        block_index += 1
 
     # If there are tool calls, emit tool_use blocks
     if tool_calls:
         for i, tc in enumerate(tool_calls):
-            tool_index = i + 1
+            tool_index = block_index + i
             try:
                 tool_input = json.loads(tc.function.arguments)
             except (json.JSONDecodeError, AttributeError):
@@ -2500,6 +2572,20 @@ Examples:
         help="Path to JSON Lines file for full request/response logging (e.g. requests.jsonl)",
     )
 
+    parser.add_argument(
+        "--enable-auto-tool-choice",
+        action="store_true",
+        default=False,
+        help="Enable automatic tool choice for tool calling models.",
+    )
+
+    parser.add_argument(
+        "--tool-call-parser",
+        type=str,
+        default=None,
+        help="Tool call parser to use (e.g. auto, mistral, qwen, llama, hermes, deepseek, glm47).",
+    )
+
     args = parser.parse_args()
 
     # Set up request file logger if specified
@@ -2543,6 +2629,11 @@ Examples:
     # Set MCP config for lifespan
     if args.mcp_config:
         os.environ["VLLM_MLX_MCP_CONFIG"] = args.mcp_config
+
+    # Configure tool calling
+    global _enable_auto_tool_choice, _tool_call_parser
+    _enable_auto_tool_choice = args.enable_auto_tool_choice
+    _tool_call_parser = args.tool_call_parser
 
     # Initialize reasoning parser if specified
     if args.reasoning_parser:
