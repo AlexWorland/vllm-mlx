@@ -58,6 +58,8 @@ def serve_command(args):
         server._default_temperature = args.default_temperature
     if args.default_top_p is not None:
         server._default_top_p = args.default_top_p
+    if args.max_context_length > 0:
+        server._max_context_length = args.max_context_length
 
     # Configure reasoning parser
     if args.reasoning_parser:
@@ -789,6 +791,7 @@ Examples:
             "mistral",
             "qwen",
             "qwen3_coder",
+            "qwen35",
             "llama",
             "hermes",
             "deepseek",
@@ -801,7 +804,7 @@ Examples:
         ],
         help=(
             "Select the tool call parser for the model. Options: "
-            "auto (auto-detect), mistral, qwen, qwen3_coder, llama, hermes, "
+            "auto (auto-detect), mistral, qwen, qwen3_coder, qwen35, llama, hermes, "
             "deepseek, kimi, granite, nemotron, xlam, functionary, glm47. "
             "Required for --enable-auto-tool-choice."
         ),
@@ -826,6 +829,16 @@ Examples:
         "--mllm",
         action="store_true",
         help="Force load model as multimodal (vision) even if name doesn't match auto-detection patterns",
+    )
+    # Context length guard
+    serve_parser.add_argument(
+        "--max-context-length",
+        type=int,
+        default=0,
+        help="Reject requests whose estimated prompt token count exceeds this limit. "
+        "Prevents Metal OOM crashes on long inputs. 0 = disabled. "
+        "Recommended: set to ~80%% of what your hardware can fit "
+        "(e.g. 40000 for 35B-4bit on 36GB).",
     )
     # Generation defaults
     serve_parser.add_argument(

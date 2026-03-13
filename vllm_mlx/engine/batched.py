@@ -284,13 +284,19 @@ class BatchedEngine(BaseEngine):
                 )
                 if max_recommended > 0:
                     soft_limit = int(max_recommended * 0.90)
+                    # Cache limit: only the remaining 10% headroom beyond the
+                    # soft limit. This prevents MLX from retaining stale
+                    # buffers that push total Metal usage over physical RAM.
+                    # (Previously hardcoded to 32GB, which on a 36GB machine
+                    # meant 27GB active + 32GB cache = 59GB of Metal demand.)
+                    cache_limit = max_recommended - soft_limit
                     mx.set_memory_limit(soft_limit)
-                    mx.set_cache_limit(32 * 1024 * 1024 * 1024)  # 32GB
+                    mx.set_cache_limit(cache_limit)
                     logger.info(
                         f"Metal memory limits set: "
                         f"allocation_limit={soft_limit / 1e9:.1f}GB "
                         f"(90% of {max_recommended / 1e9:.1f}GB), "
-                        f"cache_limit=32GB"
+                        f"cache_limit={cache_limit / 1e9:.1f}GB"
                     )
         except Exception as e:
             logger.warning(f"Failed to set Metal memory limits: {e}")
@@ -370,13 +376,32 @@ class BatchedEngine(BaseEngine):
             if tools:
                 template_kwargs["tools"] = tools
 
+            if tools:
+                logger.info(
+                    f"[chat_template] passing {len(tools)} tools to "
+                    f"{type(template_applicator).__name__}.apply_chat_template"
+                )
             try:
-                return template_applicator.apply_chat_template(
+                result = template_applicator.apply_chat_template(
                     messages, **template_kwargs
                 )
+                if tools:
+                    has_tools_section = "# Tools" in result or "<tools>" in result
+                    logger.info(
+                        f"[chat_template] tools rendered in prompt: {has_tools_section} "
+                        f"(prompt_len={len(result)} chars)"
+                    )
+                return result
             except TypeError as e:
                 # Some templates don't accept 'tools'; retry without them.
-                logger.debug(f"Chat template TypeError, retrying without extras: {e}")
+                if "tools" in template_kwargs:
+                    logger.warning(
+                        f"[chat_template] TOOLS DROPPED — apply_chat_template raised "
+                        f"TypeError: {e}. Retrying without tools. "
+                        f"The model will NOT see tool definitions."
+                    )
+                else:
+                    logger.debug(f"Chat template TypeError: {e}")
                 for key in ["tools"]:
                     if key in template_kwargs:
                         del template_kwargs[key]

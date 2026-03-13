@@ -249,6 +249,7 @@ _default_timeout: float = 300.0  # Default request timeout in seconds (5 minutes
 _default_temperature: float | None = None  # Set via --default-temperature
 _default_top_p: float | None = None  # Set via --default-top-p
 _default_repetition_penalty: float | None = None  # Set via --default-repetition-penalty
+_max_context_length: int = 0  # 0 = disabled; set via --max-context-length
 
 _FALLBACK_TEMPERATURE = 0.7
 _FALLBACK_TOP_P = 0.9
@@ -1524,6 +1525,30 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     # Add tools if provided
     if request.tools:
         chat_kwargs["tools"] = convert_tools_for_template(request.tools)
+
+    # Context length guard — reject before prefill to avoid Metal OOM crash
+    if _max_context_length > 0:
+        tokenizer = engine.tokenizer
+        if tokenizer is not None:
+            raw_text = ""
+            for msg in request.messages:
+                content = msg.content if hasattr(msg, "content") else (msg.get("content", "") if isinstance(msg, dict) else "")
+                if isinstance(content, str):
+                    raw_text += content
+                elif isinstance(content, list):
+                    for part in content:
+                        if isinstance(part, dict) and part.get("type") == "text":
+                            raw_text += part.get("text", "")
+            encode_fn = getattr(tokenizer, "encode", None) or getattr(getattr(tokenizer, "tokenizer", None), "encode", None)
+            if encode_fn is not None:
+                # Add 30% buffer for chat template overhead
+                est_tokens = int(len(encode_fn(raw_text)) * 1.3)
+                if est_tokens > _max_context_length:
+                    from fastapi import HTTPException
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Request too long: estimated {est_tokens} prompt tokens exceeds --max-context-length={_max_context_length}",
+                    )
 
     if request.stream:
         return StreamingResponse(
