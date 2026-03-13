@@ -300,6 +300,7 @@ _reasoning_parser = None  # ReasoningParser instance when enabled
 _enable_auto_tool_choice: bool = False
 _tool_call_parser: str | None = None  # Parser name: auto, mistral, qwen, llama, hermes
 _tool_parser_instance = None  # Instantiated parser
+_system_prompt_prefix: str | None = None  # Prepended to every system message
 
 
 def _load_prefix_cache_from_disk() -> None:
@@ -1490,6 +1491,10 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
 
     has_media = bool(images or videos)
 
+    # Prepend system prompt prefix if configured
+    if _system_prompt_prefix:
+        messages = _inject_system_prefix(messages, _system_prompt_prefix)
+
     # Handle response_format - inject system prompt if needed
     response_format = request.response_format
     if response_format:
@@ -1605,6 +1610,21 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     )
 
 
+def _inject_system_prefix(messages: list, prefix: str) -> list:
+    """Prepend a prefix to the system message, or insert a new one if absent."""
+    messages = list(messages)
+    for i, msg in enumerate(messages):
+        role = msg.get("role") if isinstance(msg, dict) else getattr(msg, "role", None)
+        if role == "system":
+            if isinstance(msg, dict):
+                msg["content"] = f"{prefix}\n\n{msg.get('content', '')}"
+            else:
+                msg.content = f"{prefix}\n\n{(getattr(msg, 'content', '') or '')}"
+            return messages
+    messages.insert(0, {"role": "system", "content": prefix})
+    return messages
+
+
 def _inject_json_instruction(messages: list, instruction: str) -> list:
     """
     Inject JSON instruction into messages.
@@ -1712,6 +1732,9 @@ async def create_anthropic_message(
         openai_request.messages,
         preserve_native_format=engine.preserve_native_tool_format,
     )
+
+    if _system_prompt_prefix:
+        messages = _inject_system_prefix(messages, _system_prompt_prefix)
 
     chat_kwargs = {
         "max_tokens": openai_request.max_tokens or _default_max_tokens,
@@ -1883,6 +1906,9 @@ async def _stream_anthropic_messages(
         openai_request.messages,
         preserve_native_format=engine.preserve_native_tool_format,
     )
+
+    if _system_prompt_prefix:
+        messages = _inject_system_prefix(messages, _system_prompt_prefix)
 
     chat_kwargs = {
         "max_tokens": openai_request.max_tokens or _default_max_tokens,
@@ -2222,7 +2248,54 @@ async def stream_chat_completion(
         if hasattr(output, "completion_tokens") and output.completion_tokens:
             completion_tokens = output.completion_tokens
 
-        # Use reasoning parser if enabled
+        # Tool call streaming parsing — runs FIRST so that <tool_call> blocks
+        # are intercepted before reaching the reasoning parser.  When a tool
+        # call is being accumulated (returns None) or has just been emitted
+        # (returns tool_calls), we skip the rest of the loop iteration so the
+        # reasoning parser never sees those tokens.
+        if tool_parser and delta_text:
+            if not tool_markup_possible and "<" not in delta_text:
+                tool_accumulated_text += delta_text
+                # No tool markup yet — fall through to reasoning/standard path
+            else:
+                if not tool_markup_possible:
+                    tool_markup_possible = True
+                tool_previous = tool_accumulated_text
+                tool_accumulated_text += delta_text
+                tool_result = tool_parser.extract_tool_calls_streaming(
+                    tool_previous, tool_accumulated_text, delta_text
+                )
+
+                if tool_result is None:
+                    # Inside tool call markup — suppress output entirely
+                    continue
+
+                if "tool_calls" in tool_result:
+                    # Emit structured tool calls; skip reasoning parser
+                    tool_calls_detected = True
+                    chunk = ChatCompletionChunk(
+                        id=response_id,
+                        model=request.model,
+                        choices=[
+                            ChatCompletionChunkChoice(
+                                delta=ChatCompletionChunkDelta(
+                                    tool_calls=tool_result["tool_calls"]
+                                ),
+                                finish_reason=(
+                                    "tool_calls" if output.finished else None
+                                ),
+                            )
+                        ],
+                        usage=get_usage(output) if output.finished else None,
+                    )
+                    yield f"data: {chunk.model_dump_json()}\n\n"
+                    continue
+
+                # Normal content returned by tool parser (not a tool call)
+                delta_text = tool_result.get("content", delta_text)
+
+        # Use reasoning parser if enabled (runs after tool parser so tool call
+        # tokens have already been handled / suppressed above)
         if _reasoning_parser and delta_text:
             previous_text = accumulated_text
             accumulated_text += delta_text
@@ -2250,7 +2323,7 @@ async def stream_chat_completion(
             )
             yield f"data: {chunk.model_dump_json()}\n\n"
         else:
-            # Standard path without reasoning parsing
+            # Standard path (no reasoning parser)
             content = delta_text
 
             # Filter special tokens that may leak into streaming output
@@ -2261,51 +2334,6 @@ async def stream_chat_completion(
             if is_thinking_model and not think_prefix_sent and content:
                 content = "<think>" + content
                 think_prefix_sent = True
-
-            # Tool call streaming parsing
-            if tool_parser and delta_text:
-                # Fast path: skip full parsing until '<' is seen in the stream,
-                # which could start tool markup (e.g. <tool_call>). This avoids
-                # per-token string scanning on the growing accumulated text.
-                if not tool_markup_possible and "<" not in delta_text:
-                    tool_accumulated_text += delta_text
-                    # No tool markup yet, fall through to normal chunk emission
-                else:
-                    if not tool_markup_possible:
-                        tool_markup_possible = True
-                    tool_previous = tool_accumulated_text
-                    tool_accumulated_text += delta_text
-                    tool_result = tool_parser.extract_tool_calls_streaming(
-                        tool_previous, tool_accumulated_text, delta_text
-                    )
-
-                    if tool_result is None:
-                        # Inside tool markup - suppress output
-                        continue
-
-                    if "tool_calls" in tool_result:
-                        # Emit structured tool calls
-                        tool_calls_detected = True
-                        chunk = ChatCompletionChunk(
-                            id=response_id,
-                            model=request.model,
-                            choices=[
-                                ChatCompletionChunkChoice(
-                                    delta=ChatCompletionChunkDelta(
-                                        tool_calls=tool_result["tool_calls"]
-                                    ),
-                                    finish_reason=(
-                                        "tool_calls" if output.finished else None
-                                    ),
-                                )
-                            ],
-                            usage=get_usage(output) if output.finished else None,
-                        )
-                        yield f"data: {chunk.model_dump_json()}\n\n"
-                        continue
-
-                    # Normal content from tool parser
-                    content = tool_result.get("content", "")
 
             chunk = ChatCompletionChunk(
                 id=response_id,
@@ -2573,6 +2601,13 @@ Examples:
     )
 
     parser.add_argument(
+        "--system-prompt-prefix",
+        type=str,
+        default=None,
+        help="Text prepended to every system message. Useful for injecting capability instructions for non-Claude models.",
+    )
+
+    parser.add_argument(
         "--enable-auto-tool-choice",
         action="store_true",
         default=False,
@@ -2631,9 +2666,12 @@ Examples:
         os.environ["VLLM_MLX_MCP_CONFIG"] = args.mcp_config
 
     # Configure tool calling
-    global _enable_auto_tool_choice, _tool_call_parser
+    global _enable_auto_tool_choice, _tool_call_parser, _system_prompt_prefix
     _enable_auto_tool_choice = args.enable_auto_tool_choice
     _tool_call_parser = args.tool_call_parser
+    if args.system_prompt_prefix:
+        _system_prompt_prefix = args.system_prompt_prefix
+        logger.info(f"System prompt prefix enabled ({len(_system_prompt_prefix)} chars)")
 
     # Initialize reasoning parser if specified
     if args.reasoning_parser:
