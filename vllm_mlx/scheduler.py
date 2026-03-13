@@ -969,6 +969,23 @@ def _install_mtp(
     )
 
 
+@dataclass
+class CanonicalOffsetMap:
+    """Maps canonical text positions back to original text positions.
+
+    Built during token canonicalization (SR-block stripping) and used at
+    cache-lookup time to convert a canonical-space token position back to
+    the corresponding real-token position.
+    """
+    # canon_to_real[i] = original char index for canonical char i
+    # Length = len(canonical_text) + 1 (end sentinel)
+    canon_to_real: List[int]
+    # Real-token position of first SR block (verified-safe boundary)
+    first_sr_real_token_pos: int
+    # Original decoded text (needed for encode at lookup time)
+    original_text: str
+
+
 class Scheduler:
     """
     Scheduler for continuous batching using mlx-lm BatchGenerator.
@@ -1145,35 +1162,148 @@ class Scheduler:
         """
         return self._actual_tokenizer.decode(token_ids)
 
-    def _canonicalize_tokens(self, token_ids: List[int]) -> Optional[List[int]]:
-        """Strip <system-reminder>...</system-reminder> blocks from token sequence.
+    def _canonicalize_tokens(
+        self, token_ids: List[int]
+    ) -> Optional[tuple]:
+        """Strip dynamic content from token sequence for cache key stability.
 
-        Returns canonical token IDs (with dynamic content removed) for use as
-        cache keys.  Returns None if no system-reminder blocks are found
-        (caller should fall back to the original token_ids).
+        Strips:
+        - <system-reminder>...</system-reminder> blocks (timestamps, context)
+        - cch=XXXX values in billing headers (per-request context hashes)
+
+        Returns (canonical_ids, CanonicalOffsetMap) tuple, or None if no
+        dynamic content is found.  The offset map enables precise
+        canonical→real token position mapping at cache-lookup time.
         """
         import re
 
         text = self._actual_tokenizer.decode(token_ids)
-        canonical = re.sub(
-            r"[ \t\n]*<system-reminder>.*?</system-reminder>[ \t\n]*",
-            "\n",
-            text,
-            flags=re.DOTALL,
+
+        # Collect all dynamic content spans to strip/normalize.
+        # "replace" spans get replaced with a single \n (SR blocks).
+        # "normalize" spans get replaced with a fixed value (billing hashes).
+        strip_spans = []  # (start, end, replacement)
+
+        # 1. SR blocks → "\n"
+        sr_pattern = re.compile(
+            r"[ \t\n]*<system-reminder>.*?</system-reminder>[ \t\n]*", re.DOTALL
         )
-        if len(canonical) == len(text):
-            return None  # No system-reminder blocks found
-        # Normalize runs of newlines left by stripped blocks so that
-        # different numbers of system-reminder blocks produce the same
-        # canonical text (Claude Code injects varying numbers of SR
-        # blocks between requests, joined by "\n").
-        canonical = re.sub(r"\n{2,}", "\n", canonical)
+        for m in sr_pattern.finditer(text):
+            strip_spans.append((m.start(), m.end(), "\n"))
+
+        # 2. Billing header context hash: cch=XXXX; → cch=0;
+        # Changes every request; not in SR blocks.
+        cch_pattern = re.compile(r"cch=[a-zA-Z0-9]+")
+        for m in cch_pattern.finditer(text):
+            strip_spans.append((m.start(), m.end(), "cch=0"))
+
+        if not strip_spans:
+            return None
+
+        # Sort by start position (spans don't overlap)
+        strip_spans.sort(key=lambda s: s[0])
+
+        # Find first SR block for real-token position tracking
+        sr_starts = [s for s, e, r in strip_spans if r == "\n"]
+        first_sr_char_pos = sr_starts[0] if sr_starts else len(text)
+
+        # Pass 1: Build canonical text + char offset map
+        canon_chars = []
+        canon_to_real = []
+        real_pos = 0
+        for span_start, span_end, replacement in strip_spans:
+            # Copy text before this span
+            for i in range(real_pos, span_start):
+                canon_chars.append(text[i])
+                canon_to_real.append(i)
+            # Insert replacement with offset pointing past the span
+            for ch in replacement:
+                canon_chars.append(ch)
+                canon_to_real.append(span_end)
+            real_pos = span_end
+        # Copy remaining text after last span
+        for i in range(real_pos, len(text)):
+            canon_chars.append(text[i])
+            canon_to_real.append(i)
+        canon_to_real.append(len(text))  # end sentinel
+
+        # Pass 2: Collapse \n runs (keep first, skip rest) to normalize
+        # varying numbers of SR blocks into identical canonical text
+        final_chars = []
+        final_offsets = []
+        newline_run = 0
+        for ch, off in zip(canon_chars, canon_to_real[:-1]):  # exclude sentinel
+            if ch == '\n':
+                newline_run += 1
+                if newline_run == 1:
+                    final_chars.append(ch)
+                    final_offsets.append(off)
+            else:
+                newline_run = 0
+                final_chars.append(ch)
+                final_offsets.append(off)
+        final_offsets.append(canon_to_real[-1])  # re-add sentinel
+
+        canonical = ''.join(final_chars)
         canonical_ids = self._actual_tokenizer.encode(canonical, add_special_tokens=False)
+
+        # Compute first_sr_real_token_pos
+        first_sr_prefix = text[:first_sr_char_pos]
+        first_sr_real_token_pos = len(
+            self._actual_tokenizer.encode(first_sr_prefix, add_special_tokens=False)
+        )
+
+        offset_map = CanonicalOffsetMap(
+            canon_to_real=final_offsets,
+            first_sr_real_token_pos=first_sr_real_token_pos,
+            original_text=text,
+        )
+
         logger.debug(
             f"[canonicalize] original={len(token_ids)} canonical={len(canonical_ids)} "
-            f"stripped={len(token_ids) - len(canonical_ids)} tokens"
+            f"stripped={len(token_ids) - len(canonical_ids)} tokens "
+            f"first_sr_real_tok={first_sr_real_token_pos} "
+            f"offset_map_chars={len(final_offsets)}"
         )
-        return canonical_ids
+        return canonical_ids, offset_map
+
+    def _map_canonical_to_real(self, request, canonical_matched: int) -> int:
+        """Map canonical token position to real token position using offset map.
+
+        Decodes the canonical prefix to find the character boundary, maps
+        through the offset array to the original text position, then encodes
+        the original prefix to get the real token count.
+        """
+        offset_map = request.canonical_offset_map
+        canon_ids = request.canonical_token_ids
+
+        # Decode canonical prefix to find char boundary
+        canon_prefix_text = self._actual_tokenizer.decode(
+            list(canon_ids[:canonical_matched])
+        )
+        canon_char_pos = len(canon_prefix_text)
+
+        # Map to original char position via offset array
+        idx = min(canon_char_pos, len(offset_map.canon_to_real) - 1)
+        real_char_pos = offset_map.canon_to_real[idx]
+
+        # Encode original text prefix to get real token count
+        real_prefix = offset_map.original_text[:real_char_pos]
+        real_token_pos = len(
+            self._actual_tokenizer.encode(real_prefix, add_special_tokens=False)
+        )
+
+        # Clamp to prompt length
+        real_token_pos = min(real_token_pos, len(request.prompt_token_ids))
+
+        logger.info(
+            f"[canon_to_real] request={request.request_id[:12]} "
+            f"canonical_matched={canonical_matched} "
+            f"real_mapped={real_token_pos} "
+            f"first_sr_tok={offset_map.first_sr_real_token_pos} "
+            f"tokens_saved={real_token_pos - canonical_matched}"
+        )
+        return real_token_pos
 
     def _get_stop_tokens(self) -> Set[int]:
         """Get stop token IDs from tokenizer or processor."""
@@ -1949,9 +2079,11 @@ class Scheduler:
         # Strips <system-reminder> blocks so dynamic timestamps don't
         # cause cache misses on otherwise identical conversations.
         if self.hybrid_radix_cache is not None and request.canonical_token_ids is None:
-            canonical = self._canonicalize_tokens(request.prompt_token_ids)
-            if canonical is not None:
-                request.canonical_token_ids = canonical
+            result = self._canonicalize_tokens(request.prompt_token_ids)
+            if result is not None:
+                canonical_ids, offset_map = result
+                request.canonical_token_ids = canonical_ids
+                request.canonical_offset_map = offset_map
 
         # Check prefix cache for cached KV state
         if self.hybrid_radix_cache is not None:
@@ -2013,6 +2145,14 @@ class Scheduler:
                                 ):
                                     cached_token_count = lc.offset
                                     break
+                        elif (
+                            result.match_type == "prefix"
+                            and getattr(request, "canonical_offset_map", None)
+                                is not None
+                        ):
+                            cached_token_count = self._map_canonical_to_real(
+                                request, canonical_matched
+                            )
                         # Safety: clamp to prompt length
                         cached_token_count = min(
                             cached_token_count, len(request.prompt_token_ids)
@@ -2022,6 +2162,28 @@ class Scheduler:
                             f"canonical_matched={canonical_matched} "
                             f"real_cached={cached_token_count}"
                         )
+                        # Divergence diagnostic: decode canonical tokens around
+                        # the match boundary to reveal what content is there
+                        if (
+                            result.match_type == "prefix"
+                            and request.canonical_token_ids is not None
+                            and canonical_matched < len(request.canonical_token_ids)
+                        ):
+                            try:
+                                ctx = 30
+                                cm = canonical_matched
+                                cids = list(request.canonical_token_ids)
+                                start = max(0, cm - ctx)
+                                end = min(len(cids), cm + ctx)
+                                before = self._decode_tokens(cids[start:cm])
+                                after = self._decode_tokens(cids[cm:end])
+                                logger.info(
+                                    f"[canon_diverge] at canonical token {cm}, "
+                                    f"before={before[-120:]!r} | "
+                                    f"after={after[:120]!r}"
+                                )
+                            except Exception as e:
+                                logger.debug(f"[canon_diverge] failed: {e}")
 
                     # Trim KV caches when stored sequence was longer
                     # than lookup (supersequence hit). KV caches track
@@ -2086,6 +2248,8 @@ class Scheduler:
                     f"prompt_tokens={len(request.prompt_token_ids)} "
                     f"time={_fetch_dt:.3f}s"
                 )
+            # Free offset map memory — original_text can be ~200K chars
+            request.canonical_offset_map = None
         elif self.block_aware_cache is not None:
             # Use paged cache
             block_table, remaining = self.block_aware_cache.fetch_cache(
