@@ -2006,13 +2006,17 @@ class Scheduler:
                     return None
 
                 if cache_cls is not None and hasattr(cache_cls, "from_state"):
-                    # BatchKVCache doesn't inherit from KVCache, so
-                    # _merge_caches can't handle it. Convert to KVCache
-                    # (safe because mid-prefill save is always batch_size=1).
+                    # BatchKVCache and BatchRotatingKVCache don't inherit from
+                    # their non-batch counterparts, so _merge_caches can't handle
+                    # them. Convert to the non-batch equivalent.
+                    # Safe because mid-prefill saves are always batch_size=1.
                     from mlx_lm.models.cache import (
                         BatchKVCache as _BatchKVCache,
                         KVCache as _KVCache,
+                        BatchRotatingKVCache as _BatchRotatingKVCache,
+                        RotatingKVCache as _RotatingKVCache,
                     )
+                    import mlx.core as _mx
 
                     if cache_cls is _BatchKVCache:
                         # BatchKVCache.state = (keys, values, offset, left_padding)
@@ -2021,6 +2025,28 @@ class Scheduler:
                         cache.keys = keys
                         cache.values = values
                         cache.offset = keys.shape[2]
+                    elif cache_cls is _BatchRotatingKVCache:
+                        # BatchRotatingKVCache.state = (keys, values, offset_arr, left_padding_arr)
+                        # BatchRotatingKVCache.meta_state = (max_size, _offset, _idx, rotated)
+                        # Convert to RotatingKVCache for _merge_caches compatibility.
+                        keys, values, offset_arr, _left_padding = state
+                        max_size = int(meta_state[0])
+                        _idx = int(meta_state[2])
+                        # meta_state stores rotated as "True"/"False" string
+                        rotated = meta_state[3] == "True"
+                        # Un-rotate to temporal order so RotatingKVCache._temporal_order
+                        # returns the cache unchanged (_idx == v.shape[2]).
+                        if rotated:
+                            keys = _mx.roll(keys, -_idx, axis=2)
+                            values = _mx.roll(values, -_idx, axis=2)
+                            _idx = keys.shape[2]
+                        cache = _RotatingKVCache(max_size)
+                        cache.keys = keys
+                        cache.values = values
+                        # offset_arr is mx.array([value]) for batch_size=1
+                        cache.offset = int(offset_arr.item()) if hasattr(offset_arr, "item") else int(offset_arr[0])
+                        cache._idx = _idx
+                        cache.keep = 0
                     else:
                         cache = cache_cls.from_state(state, meta_state)
                 else:
