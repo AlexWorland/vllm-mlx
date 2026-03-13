@@ -8,7 +8,8 @@ Inspired by vLLM's tool parser architecture but simplified for MLX backend.
 Available parsers:
 - auto: Auto-detecting parser that tries all formats (default)
 - mistral: Mistral models ([TOOL_CALLS] format)
-- qwen/qwen3: Qwen models (<tool_call> and [Calling tool:] formats)
+- qwen/qwen3: Qwen models (<tool_call> and [Calling tool:] formats, JSON args)
+- qwen35/qwen3.5: Qwen3.5 models (<function=name><parameter=arg> format)
 - llama/llama3/llama4: Llama models (<function=name> format)
 - hermes/nous: Hermes/NousResearch models
 - deepseek/deepseek_v3/deepseek_r1: DeepSeek models (unicode tokens)
@@ -54,6 +55,7 @@ from .llama_tool_parser import LlamaToolParser
 from .mistral_tool_parser import MistralToolParser
 from .nemotron_tool_parser import NemotronToolParser
 from .qwen_tool_parser import QwenToolParser
+from .qwen35_tool_parser import Qwen35ToolParser
 from .xlam_tool_parser import xLAMToolParser
 from .glm47_tool_parser import Glm47ToolParser
 from .harmony_tool_parser import HarmonyToolParser
@@ -67,6 +69,7 @@ __all__ = [
     "AutoToolParser",
     "MistralToolParser",
     "QwenToolParser",
+    "Qwen35ToolParser",
     "LlamaToolParser",
     "HermesToolParser",
     "DeepSeekToolParser",
