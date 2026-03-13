@@ -115,10 +115,30 @@ class CacheBlock:
     # List of (keys, values) per layer, shape: (1, n_kv_heads, block_tokens, head_dim)
     cache_data: Optional[List[Tuple[Any, Any]]] = None
 
+    # SSM support for hybrid models
+    ssm_data: Optional[List[Any]] = None
+    block_type: str = "kv"  # "kv" | "ssm" | "hybrid"
+    ssm_checkpoint_pos: int = 0
+
     # Metadata
     token_count: int = 0
     hash_value: Optional[str] = None  # Legacy string hash for compatibility
     last_access: float = field(default_factory=time.time)
+
+    def estimated_memory_bytes(self) -> int:
+        """Estimate total memory including KV data and SSM state data."""
+        total = 0
+        if self.cache_data is not None:
+            for keys, values in self.cache_data:
+                if hasattr(keys, "nbytes"):
+                    total += keys.nbytes
+                if hasattr(values, "nbytes"):
+                    total += values.nbytes
+        if self.ssm_data is not None:
+            for arr in self.ssm_data:
+                if arr is not None and hasattr(arr, "nbytes"):
+                    total += arr.nbytes
+        return total
 
     def is_full(self, block_size: int) -> bool:
         """Check if block is at capacity."""
@@ -626,6 +646,9 @@ class PagedCacheManager:
 
             block.reset_hash()
             block.cache_data = None  # Free tensor memory
+            block.ssm_data = None  # Free SSM state memory
+            block.block_type = "kv"
+            block.ssm_checkpoint_pos = 0
             self.stats.evictions += 1
             return True
 
@@ -1034,6 +1057,9 @@ class PagedCacheManager:
 
         new_block.token_count = source_block.token_count
         new_block.cache_data = source_block.cache_data
+        new_block.ssm_data = source_block.ssm_data
+        new_block.block_type = source_block.block_type
+        new_block.ssm_checkpoint_pos = source_block.ssm_checkpoint_pos
 
         source_block.ref_count -= 1
         if source_block.ref_count == 1:

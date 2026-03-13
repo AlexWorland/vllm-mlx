@@ -108,6 +108,139 @@ from .tool_parsers import ToolParserManager
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# --- Request/response file logger (JSON Lines) ---
+_request_logger: logging.Logger | None = None
+
+
+def _setup_request_logger(path: str) -> None:
+    """Configure a dedicated file logger for full request/response payloads."""
+    global _request_logger
+    _request_logger = logging.getLogger("vllm_mlx.request_log")
+    _request_logger.setLevel(logging.DEBUG)
+    _request_logger.propagate = False  # Don't echo to console
+    handler = logging.FileHandler(path, mode="a", encoding="utf-8")
+    handler.setFormatter(logging.Formatter("%(message)s"))  # Raw JSON lines
+    _request_logger.addHandler(handler)
+    logger.info(f"Request logging enabled: {path}")
+
+
+def _log_request(
+    *,
+    request_id: str,
+    endpoint: str,
+    messages: list,
+    system: str | None = None,
+    tools: list | None = None,
+    model: str | None = None,
+    max_tokens: int | None = None,
+    temperature: float | None = None,
+    stream: bool = False,
+    extra: dict | None = None,
+) -> None:
+    """Log full request payload to file, truncated summary to console."""
+    if _request_logger is None:
+        return
+    import datetime
+
+    entry = {
+        "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "dir": "request",
+        "id": request_id,
+        "endpoint": endpoint,
+        "model": model,
+        "stream": stream,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+        "n_messages": len(messages),
+    }
+    # Serialize messages — convert Pydantic models to dicts
+    serialized_msgs = []
+    for m in messages:
+        if hasattr(m, "model_dump"):
+            serialized_msgs.append(m.model_dump(exclude_none=True))
+        elif hasattr(m, "__dict__"):
+            serialized_msgs.append(
+                {k: v for k, v in m.__dict__.items() if v is not None}
+            )
+        elif isinstance(m, dict):
+            serialized_msgs.append(m)
+        else:
+            serialized_msgs.append(str(m))
+    entry["messages"] = serialized_msgs
+    if system:
+        entry["system"] = system
+    if tools:
+        tool_names = []
+        for t in tools:
+            if hasattr(t, "function") and hasattr(t.function, "name"):
+                tool_names.append(t.function.name)
+            elif isinstance(t, dict):
+                fn = t.get("function", t)
+                tool_names.append(fn.get("name", "?"))
+            else:
+                tool_names.append(str(t)[:50])
+        entry["tool_names"] = tool_names
+        entry["tools_full"] = [
+            t.model_dump(exclude_none=True) if hasattr(t, "model_dump") else t
+            for t in tools
+        ]
+    if extra:
+        entry.update(extra)
+    _request_logger.info(json.dumps(entry, default=str, ensure_ascii=False))
+
+
+def _log_response(
+    *,
+    request_id: str,
+    endpoint: str,
+    content: str | None = None,
+    reasoning: str | None = None,
+    tool_calls: list | None = None,
+    finish_reason: str | None = None,
+    prompt_tokens: int = 0,
+    completion_tokens: int = 0,
+    elapsed: float = 0.0,
+    extra: dict | None = None,
+) -> None:
+    """Log full response payload to file, truncated summary to console."""
+    if _request_logger is None:
+        return
+    import datetime
+
+    entry = {
+        "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "dir": "response",
+        "id": request_id,
+        "endpoint": endpoint,
+        "finish_reason": finish_reason,
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "elapsed_s": round(elapsed, 3),
+    }
+    if content is not None:
+        entry["content"] = content
+    if reasoning is not None:
+        entry["reasoning"] = reasoning
+    if tool_calls:
+        entry["tool_calls"] = [
+            tc.model_dump(exclude_none=True) if hasattr(tc, "model_dump") else tc
+            for tc in tool_calls
+        ]
+    if extra:
+        entry.update(extra)
+    _request_logger.info(json.dumps(entry, default=str, ensure_ascii=False))
+
+    # Truncated console summary
+    preview = (content or "")[:150].replace("\n", "\\n")
+    tc_summary = f" tool_calls={len(tool_calls)}" if tool_calls else ""
+    logger.info(
+        f"[RESPONSE] id={request_id} {finish_reason} "
+        f"tokens={prompt_tokens}+{completion_tokens} "
+        f"elapsed={elapsed:.2f}s{tc_summary} "
+        f"preview={preview!r}"
+    )
+
+
 # Global engine instance
 _engine: BaseEngine | None = None
 _model_name: str | None = None
@@ -115,6 +248,7 @@ _default_max_tokens: int = 32768
 _default_timeout: float = 300.0  # Default request timeout in seconds (5 minutes)
 _default_temperature: float | None = None  # Set via --default-temperature
 _default_top_p: float | None = None  # Set via --default-top-p
+_default_repetition_penalty: float | None = None  # Set via --default-repetition-penalty
 
 _FALLBACK_TEMPERATURE = 0.7
 _FALLBACK_TOP_P = 0.9
@@ -136,6 +270,15 @@ def _resolve_top_p(request_value: float | None) -> float:
     if _default_top_p is not None:
         return _default_top_p
     return _FALLBACK_TOP_P
+
+
+def _resolve_repetition_penalty(request_value: float | None) -> float:
+    """Resolve repetition_penalty: request > CLI default > 1.0 (disabled)."""
+    if request_value is not None:
+        return request_value
+    if _default_repetition_penalty is not None:
+        return _default_repetition_penalty
+    return 1.0
 
 
 # Global MCP manager
@@ -585,7 +728,8 @@ async def status():
             "peak_memory_gb": stats.get("metal_peak_memory_gb"),
             "cache_memory_gb": stats.get("metal_cache_memory_gb"),
         },
-        "cache": stats.get("memory_aware_cache")
+        "cache": stats.get("hybrid_radix_cache")
+        or stats.get("memory_aware_cache")
         or stats.get("paged_cache")
         or stats.get("prefix_cache"),
         "requests": stats.get("requests", []),
@@ -1227,7 +1371,7 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
     elapsed = time.perf_counter() - start_time
     tokens_per_sec = total_completion_tokens / elapsed if elapsed > 0 else 0
     logger.info(
-        f"Completion: {total_prompt_tokens} prompt + {total_completion_tokens} completion tokens in {elapsed:.2f}s ({tokens_per_sec:.1f} tok/s)"
+        f"Completion: {total_prompt_tokens} prompt + {total_completion_tokens} generation tokens in {elapsed:.2f}s ({tokens_per_sec:.1f} tok/s)"
     )
 
     return CompletionResponse(
@@ -1288,6 +1432,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     ```
     """
     engine = get_engine()
+    req_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
 
     # --- Detailed request logging ---
     n_msgs = len(request.messages)
@@ -1302,13 +1447,23 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     has_tools = bool(request.tools)
     n_tools = len(request.tools) if request.tools else 0
     logger.info(
-        f"[REQUEST] POST /v1/chat/completions stream={request.stream} "
+        f"[REQUEST] id={req_id} POST /v1/chat/completions stream={request.stream} "
         f"model={request.model!r} max_tokens={request.max_tokens} "
         f"temp={request.temperature} msgs={n_msgs} roles={msg_roles} "
         f"total_chars={total_chars} tools={n_tools} "
         f"response_format={request.response_format}"
     )
     logger.info(f"[REQUEST] last user message preview: {last_user_preview!r}")
+    _log_request(
+        request_id=req_id,
+        endpoint="/v1/chat/completions",
+        messages=request.messages,
+        tools=request.tools,
+        model=request.model,
+        max_tokens=request.max_tokens,
+        temperature=request.temperature,
+        stream=request.stream or False,
+    )
 
     # For MLLM models, keep original messages with embedded images
     # (MLLM.chat() extracts images from message content internally)
@@ -1348,6 +1503,9 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
         "max_tokens": request.max_tokens or _default_max_tokens,
         "temperature": _resolve_temperature(request.temperature),
         "top_p": _resolve_top_p(request.top_p),
+        "repetition_penalty": _resolve_repetition_penalty(
+            getattr(request, "repetition_penalty", None)
+        ),
     }
 
     # Add multimodal content
@@ -1385,9 +1543,10 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
         return Response(status_code=499)  # Client closed request
 
     elapsed = time.perf_counter() - start_time
+    prompt_tok = output.prompt_tokens if hasattr(output, "prompt_tokens") else 0
     tokens_per_sec = output.completion_tokens / elapsed if elapsed > 0 else 0
     logger.info(
-        f"Chat completion: {output.completion_tokens} tokens in {elapsed:.2f}s ({tokens_per_sec:.1f} tok/s)"
+        f"Chat completion: {prompt_tok} prompt + {output.completion_tokens} generation tokens in {elapsed:.2f}s ({tokens_per_sec:.1f} tok/s)"
     )
 
     # Parse tool calls from output using configured parser
@@ -1413,6 +1572,18 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
 
     # Determine finish reason
     finish_reason = "tool_calls" if tool_calls else output.finish_reason
+
+    _log_response(
+        request_id=req_id,
+        endpoint="/v1/chat/completions",
+        content=clean_output_text(cleaned_text) if cleaned_text else None,
+        reasoning=reasoning_text,
+        tool_calls=tool_calls,
+        finish_reason=finish_reason,
+        prompt_tokens=prompt_tok,
+        completion_tokens=output.completion_tokens,
+        elapsed=elapsed,
+    )
 
     return ChatCompletionResponse(
         model=request.model,
@@ -1484,6 +1655,7 @@ async def create_anthropic_message(
     Supports both streaming and non-streaming modes.
     """
     engine = get_engine()
+    req_id = f"msg-{uuid.uuid4().hex[:8]}"
 
     # Parse the raw body to handle Anthropic request format
     body = await request.json()
@@ -1501,12 +1673,23 @@ async def create_anthropic_message(
     sys_chars = len(anthropic_request.system) if anthropic_request.system else 0
     n_tools = len(anthropic_request.tools) if anthropic_request.tools else 0
     logger.info(
-        f"[REQUEST] POST /v1/messages (anthropic) stream={anthropic_request.stream} "
+        f"[REQUEST] id={req_id} POST /v1/messages (anthropic) stream={anthropic_request.stream} "
         f"model={anthropic_request.model!r} max_tokens={anthropic_request.max_tokens} "
         f"msgs={n_msgs} total_chars={total_chars} system_chars={sys_chars} "
         f"tools={n_tools}"
     )
     logger.info(f"[REQUEST] last user message preview: {last_user_preview!r}")
+    _log_request(
+        request_id=req_id,
+        endpoint="/v1/messages",
+        messages=anthropic_request.messages,
+        system=anthropic_request.system,
+        tools=anthropic_request.tools,
+        model=anthropic_request.model,
+        max_tokens=anthropic_request.max_tokens,
+        temperature=anthropic_request.temperature,
+        stream=anthropic_request.stream or False,
+    )
 
     # Convert Anthropic request -> OpenAI request
     openai_request = anthropic_to_openai(anthropic_request)
@@ -1514,7 +1697,7 @@ async def create_anthropic_message(
     if anthropic_request.stream:
         return StreamingResponse(
             _disconnect_guard(
-                _stream_anthropic_messages(engine, openai_request, anthropic_request),
+                _stream_anthropic_messages(engine, openai_request, anthropic_request, req_id),
                 request,
             ),
             media_type="text/event-stream",
@@ -1534,6 +1717,7 @@ async def create_anthropic_message(
         "max_tokens": openai_request.max_tokens or _default_max_tokens,
         "temperature": openai_request.temperature,
         "top_p": openai_request.top_p,
+        "repetition_penalty": _resolve_repetition_penalty(None),
     }
 
     if openai_request.tools:
@@ -1551,9 +1735,10 @@ async def create_anthropic_message(
         return Response(status_code=499)  # Client closed request
 
     elapsed = time.perf_counter() - start_time
+    prompt_tok = output.prompt_tokens if hasattr(output, "prompt_tokens") else 0
     tokens_per_sec = output.completion_tokens / elapsed if elapsed > 0 else 0
     logger.info(
-        f"Anthropic messages: {output.completion_tokens} tokens in {elapsed:.2f}s ({tokens_per_sec:.1f} tok/s)"
+        f"Anthropic messages: {prompt_tok} prompt + {output.completion_tokens} generation tokens in {elapsed:.2f}s ({tokens_per_sec:.1f} tok/s)"
     )
 
     # Parse tool calls
@@ -1568,6 +1753,17 @@ async def create_anthropic_message(
 
     # Determine finish reason
     finish_reason = "tool_calls" if tool_calls else output.finish_reason
+
+    _log_response(
+        request_id=req_id,
+        endpoint="/v1/messages",
+        content=final_content,
+        tool_calls=tool_calls,
+        finish_reason=finish_reason,
+        prompt_tokens=prompt_tok,
+        completion_tokens=output.completion_tokens,
+        elapsed=elapsed,
+    )
 
     # Build OpenAI response to convert
     openai_response = ChatCompletionResponse(
@@ -1670,6 +1866,7 @@ async def _stream_anthropic_messages(
     engine: BaseEngine,
     openai_request: ChatCompletionRequest,
     anthropic_request: AnthropicRequest,
+    req_id: str = "",
 ) -> AsyncIterator[str]:
     """
     Stream Anthropic Messages API SSE events.
@@ -1691,6 +1888,7 @@ async def _stream_anthropic_messages(
         "max_tokens": openai_request.max_tokens or _default_max_tokens,
         "temperature": openai_request.temperature,
         "top_p": openai_request.top_p,
+        "repetition_penalty": _resolve_repetition_penalty(None),
     }
 
     if openai_request.tools:
@@ -1726,11 +1924,19 @@ async def _stream_anthropic_messages(
     # Stream content deltas
     accumulated_text = ""
     completion_tokens = 0
+    prompt_tokens = 0
+    first_token_time = None
 
     async for output in engine.stream_chat(messages=messages, **chat_kwargs):
         delta_text = output.new_text
 
+        # Capture first token time for prefill speed measurement
+        if first_token_time is None:
+            first_token_time = time.perf_counter()
+
         # Track token counts
+        if hasattr(output, "prompt_tokens") and output.prompt_tokens:
+            prompt_tokens = output.prompt_tokens
         if hasattr(output, "completion_tokens") and output.completion_tokens:
             completion_tokens = output.completion_tokens
 
@@ -1800,9 +2006,26 @@ async def _stream_anthropic_messages(
 
     # Log throughput
     elapsed = time.perf_counter() - start_time
-    tokens_per_sec = completion_tokens / elapsed if elapsed > 0 else 0
+    prefill_s = first_token_time - start_time if first_token_time else elapsed
+    gen_s = elapsed - prefill_s
+    gen_tps = completion_tokens / gen_s if gen_s > 0 else 0
+    prefill_tps = prompt_tokens / prefill_s if prefill_s > 0 else 0
     logger.info(
-        f"Anthropic messages (stream): {completion_tokens} tokens in {elapsed:.2f}s ({tokens_per_sec:.1f} tok/s)"
+        f"Anthropic messages (stream): "
+        f"prefill={prompt_tokens} tokens in {prefill_s:.2f}s ({prefill_tps:.1f} tok/s) | "
+        f"generation={completion_tokens} tokens in {gen_s:.2f}s ({gen_tps:.1f} tok/s) | "
+        f"total={elapsed:.2f}s"
+    )
+
+    _log_response(
+        request_id=req_id,
+        endpoint="/v1/messages (stream)",
+        content=accumulated_text or None,
+        tool_calls=tool_calls,
+        finish_reason=stop_reason,
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        elapsed=elapsed,
     )
 
     # Emit message_stop
@@ -1888,6 +2111,7 @@ async def stream_chat_completion(
     prompt_tokens = 0
     completion_tokens = 0
     last_output = None
+    first_token_time = None
 
     # Tool call streaming state
     global _tool_parser_instance
@@ -1915,6 +2139,10 @@ async def stream_chat_completion(
     async for output in engine.stream_chat(messages=messages, **kwargs):
         delta_text = output.new_text
         last_output = output
+
+        # Capture first token time for prefill speed measurement
+        if first_token_time is None:
+            first_token_time = time.perf_counter()
 
         # Track token counts from output (updated each chunk)
         if hasattr(output, "prompt_tokens") and output.prompt_tokens:
@@ -2063,9 +2291,25 @@ async def stream_chat_completion(
 
     # Log throughput
     elapsed = time.perf_counter() - start_time
-    tokens_per_sec = completion_tokens / elapsed if elapsed > 0 else 0
+    prefill_s = first_token_time - start_time if first_token_time else elapsed
+    gen_s = elapsed - prefill_s
+    gen_tps = completion_tokens / gen_s if gen_s > 0 else 0
+    prefill_tps = prompt_tokens / prefill_s if prefill_s > 0 else 0
     logger.info(
-        f"Chat completion (stream): {completion_tokens} tokens in {elapsed:.2f}s ({tokens_per_sec:.1f} tok/s)"
+        f"Chat completion (stream): "
+        f"prefill={prompt_tokens} tokens in {prefill_s:.2f}s ({prefill_tps:.1f} tok/s) | "
+        f"generation={completion_tokens} tokens in {gen_s:.2f}s ({gen_tps:.1f} tok/s) | "
+        f"total={elapsed:.2f}s"
+    )
+
+    _log_response(
+        request_id=response_id,
+        endpoint="/v1/chat/completions (stream)",
+        content=accumulated_text or None,
+        finish_reason="stop",
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        elapsed=elapsed,
     )
 
     # Send final chunk with usage if requested
@@ -2225,18 +2469,54 @@ Examples:
         default=None,
         help="Default top_p for generation when not specified in request",
     )
+    parser.add_argument(
+        "--default-repetition-penalty",
+        type=float,
+        default=None,
+        help="Default repetition penalty (1.0=disabled, 1.05-1.5 recommended for Qwen3.5)",
+    )
+    parser.add_argument(
+        "--use-hybrid-cache",
+        action="store_true",
+        help="Use MARCONI-inspired hybrid radix cache for attention+SSM models (e.g., Qwen3.5)",
+    )
+    parser.add_argument(
+        "--hybrid-cache-memory-mb",
+        type=int,
+        default=None,
+        help="Memory limit for hybrid cache in MB (default: unlimited)",
+    )
+    parser.add_argument(
+        "--chunked-prefill-tokens",
+        type=int,
+        default=0,
+        help="Max tokens per prefill chunk (0 = auto). Limits peak memory during long prompt processing.",
+    )
+
+    parser.add_argument(
+        "--request-log",
+        type=str,
+        default=None,
+        help="Path to JSON Lines file for full request/response logging (e.g. requests.jsonl)",
+    )
 
     args = parser.parse_args()
 
+    # Set up request file logger if specified
+    if args.request_log:
+        _setup_request_logger(args.request_log)
+
     # Set global configuration
     global _api_key, _default_timeout, _rate_limiter
-    global _default_temperature, _default_top_p
+    global _default_temperature, _default_top_p, _default_repetition_penalty
     _api_key = args.api_key
     _default_timeout = args.timeout
     if args.default_temperature is not None:
         _default_temperature = args.default_temperature
     if args.default_top_p is not None:
         _default_top_p = args.default_top_p
+    if getattr(args, "default_repetition_penalty", None) is not None:
+        _default_repetition_penalty = args.default_repetition_penalty
 
     # Configure rate limiter
     if args.rate_limit > 0:
@@ -2276,10 +2556,22 @@ Examples:
     # Pre-load embedding model if specified
     load_embedding_model(args.embedding_model, lock=True)
 
+    # Build scheduler config if batching is enabled
+    scheduler_config = None
+    if args.continuous_batching:
+        from .scheduler import SchedulerConfig
+
+        scheduler_config = SchedulerConfig(
+            use_hybrid_cache=getattr(args, "use_hybrid_cache", False),
+            hybrid_cache_memory_mb=getattr(args, "hybrid_cache_memory_mb", None),
+            chunked_prefill_tokens=getattr(args, "chunked_prefill_tokens", 0),
+        )
+
     # Load model before starting server
     load_model(
         args.model,
         use_batching=args.continuous_batching,
+        scheduler_config=scheduler_config,
         max_tokens=args.max_tokens,
         force_mllm=args.mllm,
     )

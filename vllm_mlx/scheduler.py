@@ -21,9 +21,11 @@ import mlx.core as mx
 from mlx_lm.generate import BatchGenerator
 from mlx_lm.sample_utils import make_sampler
 
+from .hybrid_cache_entry import classify_cache_layers
 from .memory_cache import MemoryAwarePrefixCache, MemoryCacheConfig
 from .paged_cache import PagedCacheManager
 from .prefix_cache import BlockAwarePrefixCache, PrefixCacheManager
+from .radix_cache_hybrid import HybridModelConfig, RadixCacheHybrid
 from .request import Request, RequestOutput, RequestStatus, SamplingParams
 from .utils.mamba_cache import ensure_mamba_support
 
@@ -83,6 +85,10 @@ class SchedulerConfig:
     )
     paged_cache_block_size: int = 64  # Tokens per block
     max_cache_blocks: int = 1000  # Maximum number of cache blocks
+
+    # Hybrid radix cache (MARCONI-inspired, for hybrid attention+SSM models)
+    use_hybrid_cache: bool = False
+    hybrid_cache_memory_mb: Optional[int] = None  # None = unlimited
 
     # Chunked prefill: max tokens to prefill per scheduler step (0 = disabled)
     # When enabled, large prompts are split into chunks so that active
@@ -270,6 +276,26 @@ def _install_chunked_prefill(
 
             n_to_process = min(budget, remaining - 1) if remaining > 1 else 0
 
+            # Align chunk to land exactly on prefix_boundary so
+            # mid_prefill_save can capture the boundary state.
+            if (
+                n_to_process > 0
+                and mid_prefill_save is not None
+                and uid_to_request_id is not None
+                and requests is not None
+                and len(partial["uids"]) == 1
+            ):
+                _uid0 = partial["uids"][0]
+                _rid0 = uid_to_request_id.get(_uid0)
+                _req0 = requests.get(_rid0) if _rid0 else None
+                if _req0:
+                    _pb = getattr(_req0, "prefix_boundary", 0)
+                    _cached = getattr(_req0, "cached_tokens", 0) or 0
+                    _so_far = _cached + partial["processed"]
+                    _distance_to_boundary = _pb - _so_far
+                    if 0 < _distance_to_boundary < n_to_process:
+                        n_to_process = _distance_to_boundary
+
             if n_to_process > 0:
                 self.model(mx.contiguous(inputs[:, :n_to_process]), cache=prompt_cache)
                 mx.eval([c.state for c in prompt_cache])
@@ -392,6 +418,7 @@ def _install_chunked_prefill(
                         caches,
                         samplers,
                         logits_processors,
+                        _prompt_checkpoints,
                     ) = zip(*batch_prompts)
                     lengths = [len(p) for p in inputs_raw]
                     max_length = max(lengths)
@@ -434,7 +461,8 @@ def _install_chunked_prefill(
                         _cached = getattr(_req0, "cached_tokens", 0) if _req0 else 0
                         _adjusted_pb = _pb - _cached
                         if 0 < _adjusted_pb < padded.shape[1]:
-                            _first_chunk = _adjusted_pb
+                            # Use boundary as target but still respect budget
+                            _first_chunk = min(_adjusted_pb, budget)
                     n_to_process = min(_first_chunk, padded.shape[1] - 1)
                     if n_to_process > 0:
                         self.model(
@@ -976,6 +1004,25 @@ class Scheduler:
         # Detect if tokenizer is a processor (MLLM) and get the actual tokenizer
         self._actual_tokenizer = self._get_actual_tokenizer(tokenizer)
 
+        # One-time encode round-trip consistency check
+        if self._actual_tokenizer is not None:
+            try:
+                test_str = "<|im_start|>system\ntest<|im_end|>"
+                first_encode = self._actual_tokenizer.encode(test_str)
+                decoded = self._actual_tokenizer.decode(first_encode)
+                re_encoded = self._actual_tokenizer.encode(decoded, add_special_tokens=False)
+                if first_encode != re_encoded:
+                    logger.warning(
+                        f"[tokenizer_check] encode/decode round-trip mismatch: "
+                        f"encode={len(first_encode)} tokens, "
+                        f"decode→re-encode={len(re_encoded)} tokens. "
+                        f"Cache canonicalization may produce inconsistent keys."
+                    )
+                else:
+                    logger.debug("[tokenizer_check] encode/decode round-trip OK")
+            except Exception as e:
+                logger.debug(f"[tokenizer_check] skipped: {e}")
+
         # Request management - following vLLM's design
         self.waiting: deque[Request] = deque()  # Waiting queue (FCFS)
         self.running: Dict[str, Request] = {}  # Running requests by ID
@@ -995,9 +1042,31 @@ class Scheduler:
         self.memory_aware_cache: Optional[MemoryAwarePrefixCache] = None
         self.paged_cache_manager: Optional[PagedCacheManager] = None
         self.block_aware_cache: Optional[BlockAwarePrefixCache] = None
+        self.hybrid_radix_cache: Optional[RadixCacheHybrid] = None
+        self._hybrid_layer_indices: Optional[Tuple[List[int], List[int]]] = None
 
         if self.config.enable_prefix_cache:
-            if self.config.use_paged_cache:
+            if self.config.use_hybrid_cache:
+                # MARCONI-inspired hybrid cache for attention+SSM models
+                hybrid_config = HybridModelConfig.from_model(model)
+                max_bytes = 0
+                if self.config.hybrid_cache_memory_mb is not None:
+                    max_bytes = self.config.hybrid_cache_memory_mb * 1024 * 1024
+                self.hybrid_radix_cache = RadixCacheHybrid(
+                    config=hybrid_config,
+                    max_memory_bytes=max_bytes,
+                )
+                # Cache layer indices for fast split/merge
+                cache = model.make_cache()
+                kv_idx, ssm_idx = classify_cache_layers(cache)
+                self._hybrid_layer_indices = (kv_idx, ssm_idx)
+                del cache
+                logger.info(
+                    f"Hybrid radix cache enabled: "
+                    f"{hybrid_config.num_attention_layers} attn + "
+                    f"{hybrid_config.num_ssm_layers} ssm layers"
+                )
+            elif self.config.use_paged_cache:
                 # Use paged cache for memory efficiency
                 self.paged_cache_manager = PagedCacheManager(
                     block_size=self.config.paged_cache_block_size,
@@ -1076,6 +1145,36 @@ class Scheduler:
         """
         return self._actual_tokenizer.decode(token_ids)
 
+    def _canonicalize_tokens(self, token_ids: List[int]) -> Optional[List[int]]:
+        """Strip <system-reminder>...</system-reminder> blocks from token sequence.
+
+        Returns canonical token IDs (with dynamic content removed) for use as
+        cache keys.  Returns None if no system-reminder blocks are found
+        (caller should fall back to the original token_ids).
+        """
+        import re
+
+        text = self._actual_tokenizer.decode(token_ids)
+        canonical = re.sub(
+            r"[ \t\n]*<system-reminder>.*?</system-reminder>[ \t\n]*",
+            "\n",
+            text,
+            flags=re.DOTALL,
+        )
+        if len(canonical) == len(text):
+            return None  # No system-reminder blocks found
+        # Normalize runs of newlines left by stripped blocks so that
+        # different numbers of system-reminder blocks produce the same
+        # canonical text (Claude Code injects varying numbers of SR
+        # blocks between requests, joined by "\n").
+        canonical = re.sub(r"\n{2,}", "\n", canonical)
+        canonical_ids = self._actual_tokenizer.encode(canonical, add_special_tokens=False)
+        logger.debug(
+            f"[canonicalize] original={len(token_ids)} canonical={len(canonical_ids)} "
+            f"stripped={len(token_ids) - len(canonical_ids)} tokens"
+        )
+        return canonical_ids
+
     def _get_stop_tokens(self) -> Set[int]:
         """Get stop token IDs from tokenizer or processor."""
         stop_tokens = set()
@@ -1134,8 +1233,14 @@ class Scheduler:
         # Install chunked prefill when explicitly configured OR when
         # memory-aware cache is active (needed for prefix_boundary saves
         # in agentic multi-turn workloads with hybrid Mamba+Transformer models).
+        # Also needed for hybrid_radix_cache to enable prefix_boundary saves
+        # (prevents <think> token from breaking multi-turn cache reuse).
         chunked_budget = self.config.chunked_prefill_tokens
-        need_chunked = chunked_budget > 0 or self.memory_aware_cache is not None
+        need_chunked = (
+            chunked_budget > 0
+            or self.memory_aware_cache is not None
+            or self.hybrid_radix_cache is not None
+        )
         if need_chunked:
             if chunked_budget <= 0:
                 # No explicit budget — use a very large value so normal
@@ -1147,6 +1252,9 @@ class Scheduler:
             if save_interval > 0 and self.memory_aware_cache is not None:
                 mid_prefill_cb = self._make_mid_prefill_save_callback(save_interval)
                 logger.info(f"[mid_prefill_cache] enabled, interval={save_interval}")
+            elif save_interval > 0 and self.hybrid_radix_cache is not None:
+                mid_prefill_cb = self._make_hybrid_radix_mid_prefill_callback()
+                logger.info(f"[mid_prefill_cache] enabled for hybrid_radix_cache")
             prompt_cache_cb = None
             if self.memory_aware_cache is not None:
                 prompt_cache_cb = self._make_prompt_cache_save_callback()
@@ -1197,6 +1305,21 @@ class Scheduler:
             request = self.requests.get(request_id)
             if not request or not request.prompt_token_ids:
                 return
+
+            # For hybrid models, tag extracted cache with SSM metadata
+            if isinstance(extracted_cache, list) and extracted_cache:
+                has_ssm = any(
+                    isinstance(s, dict) and s.get("is_ssm", False)
+                    for s in extracted_cache
+                )
+                if has_ssm:
+                    # Record that this prompt cache entry contains SSM state
+                    if not hasattr(request, "_has_ssm_cache"):
+                        request._has_ssm_cache = True
+                    logger.debug(
+                        f"[prompt_cache_save] hybrid model detected for "
+                        f"request={request_id[:12]}, SSM states included"
+                    )
 
             prompt_tokens = list(request.prompt_token_ids)
             _t0 = _time.monotonic()
@@ -1253,6 +1376,19 @@ class Scheduler:
             if not extracted:
                 return
 
+            # For hybrid models, check if we have SSM layers and tag the entry
+            has_ssm = any(s.get("is_ssm", False) for s in extracted)
+            if has_ssm:
+                ssm_checkpoint_pos = total_cached
+                # Store SSM checkpoint position as metadata on the request
+                if not hasattr(request, "_ssm_checkpoint_positions"):
+                    request._ssm_checkpoint_positions = []
+                request._ssm_checkpoint_positions.append(ssm_checkpoint_pos)
+                logger.debug(
+                    f"[mid_prefill_cache] SSM checkpoint at token {ssm_checkpoint_pos} "
+                    f"for request={request_id[:12]}"
+                )
+
             # Reconstruct cache objects (directly usable by BatchGenerator)
             reconstructed = self._reconstruct_cache_from_states(extracted)
             if not reconstructed:
@@ -1285,6 +1421,88 @@ class Scheduler:
                 )
 
         return _mid_prefill_save
+
+    def _make_hybrid_radix_mid_prefill_callback(self):
+        """Create a mid-prefill save callback for the hybrid radix cache.
+
+        Saves KV/SSM cache state at the prefix_boundary during chunked
+        prefill.  This is critical for multi-turn conversations with models
+        that use <think> generation prompts (e.g. Qwen3): the <think> token
+        at the end of the prompt causes token divergence between stored and
+        lookup keys, capping cache reuse at the system/tools prefix.
+
+        By saving at the prefix_boundary (which corresponds to everything
+        before the last user message), subsequent requests sharing the same
+        conversation history can reuse the full prefix instead of only the
+        system/tools section.
+        """
+        import time as _time
+
+        def _hybrid_radix_mid_prefill_save(uid, processed_tokens, prompt_cache):
+            request_id = self.uid_to_request_id.get(uid)
+            if not request_id:
+                return
+            request = self.requests.get(request_id)
+            if not request or not request.prompt_token_ids:
+                return
+
+            total_cached = (request.cached_tokens or 0) + processed_tokens
+
+            # Only save at prefix_boundary for the hybrid radix cache.
+            # This is the conversation-history boundary where multi-turn
+            # cache reuse matters most.
+            prefix_boundary = getattr(request, "prefix_boundary", 0)
+            if prefix_boundary <= 0 or total_cached != prefix_boundary:
+                return
+
+            # Extract immutable state snapshots
+            extracted = self._extract_cache_states(prompt_cache)
+            if not extracted:
+                return
+
+            # Reconstruct cache objects
+            reconstructed = self._reconstruct_cache_from_states(extracted)
+            if not reconstructed:
+                return
+
+            # Split into KV and SSM states for the radix cache
+            kv_states, ssm_states = self._split_hybrid_states(reconstructed)
+
+            # When canonical keys are active, skip mid-prefill save.
+            # Independent canonicalization of the prefix produces keys that
+            # are incompatible with the full canonical key when system-reminder
+            # tags cross the prefix boundary (partial tags can't be stripped,
+            # inflating the canonical prefix and creating a competing tree entry).
+            # The final store at request completion handles multi-turn reuse
+            # via prefix matching in the radix tree.
+            canonical_ids = getattr(request, "canonical_token_ids", None)
+            if canonical_ids is not None:
+                logger.debug(
+                    f"[mid_prefill_cache] request={request_id[:12]} "
+                    f"skipping mid-prefill save (canonical keys active, "
+                    f"final store will handle multi-turn reuse)"
+                )
+                return
+            else:
+                prefix_tokens = tuple(request.prompt_token_ids[:total_cached])
+                boundary_label = f"boundary={total_cached}"
+
+            _t0 = _time.monotonic()
+            self.hybrid_radix_cache.insert(
+                prefix_tokens,
+                kv_states,
+                ssm_states if ssm_states else None,
+            )
+            _dt = _time.monotonic() - _t0
+
+            logger.info(
+                f"[mid_prefill_cache] request={request_id[:12]} "
+                f"saved {boundary_label}/{len(request.prompt_token_ids)} tokens "
+                f"({'canonical' if canonical_ids else 'original'}) "
+                f"to hybrid_radix_cache, store_time={_dt:.3f}s"
+            )
+
+        return _hybrid_radix_mid_prefill_save
 
     def _close_batch_generator(self) -> None:
         """Properly close BatchGenerator to restore wired_limit."""
@@ -1363,9 +1581,16 @@ class Scheduler:
         if isinstance(cache, list):
             if len(cache) == 0:
                 return False
+            # For hybrid models, SSM layers can be None (will be recomputed)
+            ssm_positions = set()
+            if self._hybrid_layer_indices is not None:
+                _, ssm_idx = self._hybrid_layer_indices
+                ssm_positions = set(ssm_idx)
             # Check each layer
-            for layer_cache in cache:
+            for i, layer_cache in enumerate(cache):
                 if layer_cache is None:
+                    if i in ssm_positions:
+                        continue  # SSM layers can be None (recomputed)
                     return False
                 # Check if layer has expected structure
                 if hasattr(layer_cache, "keys") and layer_cache.keys is None:
@@ -1423,12 +1648,20 @@ class Scheduler:
                 if hasattr(layer_cache, "state") and hasattr(layer_cache, "meta_state"):
                     state = layer_cache.state  # (keys, values) or more for Mamba
                     meta = layer_cache.meta_state  # (offset,) as strings
+                    # Tag layer as SSM (non-trimmable) vs KV (trimmable)
+                    # for hybrid model support. ArraysCache/MambaCache layers
+                    # lack is_trimmable() or return False; KVCache returns True.
+                    is_ssm = not (
+                        hasattr(layer_cache, "is_trimmable")
+                        and layer_cache.is_trimmable()
+                    )
                     extracted.append(
                         {
                             "state": state,
                             "meta_state": meta,
                             "class_name": type(layer_cache).__name__,
                             "class_ref": type(layer_cache),
+                            "is_ssm": is_ssm,
                         }
                     )
             except Exception as e:
@@ -1436,6 +1669,183 @@ class Scheduler:
                 continue
 
         return extracted if len(extracted) == len(raw_cache) else []
+
+    def _separate_hybrid_states(
+        self, extracted_states: List[Dict[str, Any]]
+    ) -> Tuple[List[Dict[str, Any]], List[int], List[int]]:
+        """Separate extracted cache states into KV and SSM components.
+
+        Uses the ``is_ssm`` flag set by ``_extract_cache_states`` to classify
+        each layer.  For non-hybrid models (all layers are KV), ssm_indices
+        will be empty and the caller can skip hybrid-specific logic.
+
+        Args:
+            extracted_states: List of dicts from ``_extract_cache_states()``,
+                each containing an ``is_ssm`` boolean flag.
+
+        Returns:
+            Tuple of (full_cache_states, kv_only_indices, ssm_only_indices)
+            where indices refer to positions in the extracted_states list.
+        """
+        kv_indices: List[int] = []
+        ssm_indices: List[int] = []
+
+        for i, layer_state in enumerate(extracted_states):
+            if layer_state.get("is_ssm", False):
+                ssm_indices.append(i)
+            else:
+                kv_indices.append(i)
+
+        return extracted_states, kv_indices, ssm_indices
+
+    def _restore_hybrid_cache(
+        self,
+        cached_states: List[Any],
+        request: "Request",
+        matched_tokens: int,
+    ) -> Optional[List[Any]]:
+        """Restore cache handling KV-only hits for hybrid models.
+
+        When a cached entry has KV states but no SSM states (common after
+        eviction or when SSM admission was rejected), this method:
+        - Restores KV cache layers directly
+        - Flags the request with ``_needs_ssm_recompute = True``
+        - Sets ``_ssm_recompute_from = matched_tokens``
+
+        This enables the selective layer reuse optimization where we skip
+        O(L^2) attention recomputation and only redo O(L) recurrent layers.
+
+        For non-hybrid cached states (all KV), delegates to standard
+        reconstruction and returns without setting any flags.
+
+        Args:
+            cached_states: List of cache objects (from memory_aware_cache.fetch
+                or reconstructed from extracted states).
+            request: The request being restored — hybrid flags are set on it.
+            matched_tokens: Number of tokens matched from the cache.
+
+        Returns:
+            The cache list (possibly the same reference), or None on failure.
+        """
+        if not cached_states:
+            return None
+
+        # Check if any layers are SSM (non-trimmable)
+        has_ssm_layers = False
+        has_ssm_state = False
+
+        # Use cached layer indices if available (handles None SSM layers)
+        if self._hybrid_layer_indices is not None:
+            _, ssm_idx = self._hybrid_layer_indices
+            has_ssm_layers = len(ssm_idx) > 0
+            # Check if any SSM position has actual state data
+            for idx in ssm_idx:
+                if idx < len(cached_states) and cached_states[idx] is not None:
+                    layer_cache = cached_states[idx]
+                    if hasattr(layer_cache, "cache") and isinstance(
+                        layer_cache.cache, list
+                    ):
+                        if any(arr is not None for arr in layer_cache.cache):
+                            has_ssm_state = True
+                            break
+                    elif hasattr(layer_cache, "state"):
+                        state = layer_cache.state
+                        if isinstance(state, (list, tuple)) and any(
+                            s is not None for s in state
+                        ):
+                            has_ssm_state = True
+                            break
+        else:
+            # Fallback: detect SSM layers from cache objects themselves
+            for layer_cache in cached_states:
+                if layer_cache is None:
+                    continue
+                is_trimmable = (
+                    hasattr(layer_cache, "is_trimmable")
+                    and layer_cache.is_trimmable()
+                )
+                if not is_trimmable:
+                    has_ssm_layers = True
+                    # Check if this SSM layer actually has state data
+                    if hasattr(layer_cache, "cache") and isinstance(
+                        layer_cache.cache, list
+                    ):
+                        if any(arr is not None for arr in layer_cache.cache):
+                            has_ssm_state = True
+                    elif hasattr(layer_cache, "state"):
+                        state = layer_cache.state
+                        if isinstance(state, (list, tuple)) and any(
+                            s is not None for s in state
+                        ):
+                            has_ssm_state = True
+
+        if not has_ssm_layers:
+            # Non-hybrid model, no special handling needed
+            return cached_states
+
+        if has_ssm_state:
+            # Full hybrid cache hit (both KV and SSM present)
+            logger.debug(
+                f"[restore_hybrid] full hybrid hit for "
+                f"request={request.request_id[:12]} at {matched_tokens} tokens"
+            )
+            return cached_states
+
+        # KV-only hit: SSM layers exist but have no meaningful state.
+        # Flag the request so the batch generator knows to recompute
+        # only the recurrent layers from the matched position.
+        request._needs_ssm_recompute = True
+        request._ssm_recompute_from = matched_tokens
+        logger.info(
+            f"[restore_hybrid] KV-only hit for "
+            f"request={request.request_id[:12]}, "
+            f"SSM recompute needed from token {matched_tokens}"
+        )
+        return cached_states
+
+    def _merge_hybrid_states(
+        self,
+        kv_states: Optional[List[Any]],
+        ssm_states: Optional[List[Any]],
+    ) -> Optional[List[Any]]:
+        """Reconstruct full per-layer cache list from split KV/SSM states.
+
+        Uses cached _hybrid_layer_indices to place states at correct positions.
+        SSM positions without states get fresh empty cache objects (not None)
+        because BatchGenerator.insert() calls .size() on every layer.
+        """
+        if self._hybrid_layer_indices is None:
+            return None
+        kv_indices, ssm_indices = self._hybrid_layer_indices
+        # Start with fresh caches for all layers — ensures SSM slots have
+        # valid objects with .size() even when ssm_states is None
+        cache = self.model.make_cache()
+
+        if kv_states:
+            for i, idx in enumerate(kv_indices):
+                if i < len(kv_states):
+                    cache[idx] = kv_states[i]
+
+        if ssm_states:
+            for i, idx in enumerate(ssm_indices):
+                if i < len(ssm_states):
+                    cache[idx] = ssm_states[i]
+
+        return cache
+
+    def _split_hybrid_states(
+        self, cache: List[Any]
+    ) -> Tuple[List[Any], List[Any]]:
+        """Split full per-layer cache list into separate KV and SSM states.
+
+        Uses cached _hybrid_layer_indices for index mapping.
+        """
+        if self._hybrid_layer_indices is None:
+            return cache, []
+        kv_indices, ssm_indices = self._hybrid_layer_indices
+        kv_states = [cache[i] for i in kv_indices if i < len(cache)]
+        ssm_states = [cache[i] for i in ssm_indices if i < len(cache)]
+        return kv_states, ssm_states
 
     def _reconstruct_cache_from_states(
         self, extracted_states: List[Dict[str, Any]]
@@ -1535,8 +1945,148 @@ class Scheduler:
                 request.prompt_token_ids = list(request.prompt)
             request.num_prompt_tokens = len(request.prompt_token_ids)
 
+        # Compute canonical token IDs for cache key normalization.
+        # Strips <system-reminder> blocks so dynamic timestamps don't
+        # cause cache misses on otherwise identical conversations.
+        if self.hybrid_radix_cache is not None and request.canonical_token_ids is None:
+            canonical = self._canonicalize_tokens(request.prompt_token_ids)
+            if canonical is not None:
+                request.canonical_token_ids = canonical
+
         # Check prefix cache for cached KV state
-        if self.block_aware_cache is not None:
+        if self.hybrid_radix_cache is not None:
+            import time as _time
+            _fetch_t0 = _time.monotonic()
+            # Use canonical tokens for cache lookup when available
+            cache_key_ids = request.canonical_token_ids or request.prompt_token_ids
+            token_key = tuple(cache_key_ids)
+            # Diagnostic: log first 30 tokens of lookup key and tree root edges
+            logger.info(
+                f"[cache_diag] request={request.request_id[:12]} "
+                f"key_len={len(token_key)} "
+                f"is_canonical={request.canonical_token_ids is not None} "
+                f"first_30={list(token_key[:30])}"
+            )
+            try:
+                tree_root = self.hybrid_radix_cache._root
+                n_children = len(tree_root.children)
+                logger.info(f"[cache_diag] tree root has {n_children} children")
+                for first_tok, child in list(tree_root.children.items())[:3]:
+                    edge_toks = getattr(child, 'token_ids', None)
+                    edge_info = f"first_tok={first_tok} depth={child.depth}"
+                    if edge_toks is not None:
+                        edge_info += f" edge_len={len(edge_toks)} edge_first_10={list(edge_toks[:10])}"
+                    edge_info += f" has_data={child.kv_states is not None}"
+                    n_sub = len(child.children) if hasattr(child, 'children') else 0
+                    edge_info += f" n_children={n_sub}"
+                    logger.info(f"[cache_diag] tree_child: {edge_info}")
+            except Exception as e:
+                logger.info(f"[cache_diag] tree inspection failed: {e}")
+            result = self.hybrid_radix_cache.lookup(token_key)
+            _fetch_dt = _time.monotonic() - _fetch_t0
+
+            if result.match_type != "none" and result.kv_states is not None:
+                # Reconstruct full per-layer cache list from split KV/SSM
+                cache = self._merge_hybrid_states(
+                    result.kv_states, result.ssm_states
+                )
+                if cache is not None:
+                    canonical_matched = result.matched_length
+
+                    # When using canonical keys, matched_length is in
+                    # canonical space.  For exact matches the KV cache's
+                    # internal offset is authoritative (it reflects how
+                    # many real tokens are covered).  For prefix/partial
+                    # matches the KV states belong to a LONGER stored
+                    # sequence — lc.offset reflects that full sequence,
+                    # not the matching prefix.  Using it would skip
+                    # prefill for tokens with stale KV states.
+                    cached_token_count = canonical_matched
+                    if request.canonical_token_ids is not None:
+                        if result.match_type == "exact":
+                            for lc in cache:
+                                if (
+                                    lc is not None
+                                    and hasattr(lc, "is_trimmable")
+                                    and lc.is_trimmable()
+                                    and hasattr(lc, "offset")
+                                ):
+                                    cached_token_count = lc.offset
+                                    break
+                        # Safety: clamp to prompt length
+                        cached_token_count = min(
+                            cached_token_count, len(request.prompt_token_ids)
+                        )
+                        logger.debug(
+                            f"[cache_fetch] match_type={result.match_type} "
+                            f"canonical_matched={canonical_matched} "
+                            f"real_cached={cached_token_count}"
+                        )
+
+                    # Trim KV caches when stored sequence was longer
+                    # than lookup (supersequence hit). KV caches track
+                    # an offset that must match cached_token_count.
+                    for layer_cache in cache:
+                        if layer_cache is None:
+                            continue
+                        if (
+                            hasattr(layer_cache, "is_trimmable")
+                            and layer_cache.is_trimmable()
+                            and hasattr(layer_cache, "offset")
+                            and layer_cache.offset > cached_token_count
+                        ):
+                            excess = layer_cache.offset - cached_token_count
+                            layer_cache.trim(excess)
+                    cache = self._restore_hybrid_cache(
+                        cache, request, cached_token_count
+                    )
+                    if cache is not None:
+                        request.cache_hit_type = result.match_type
+                        request.prompt_cache = cache
+                        request.cached_tokens = cached_token_count
+                        request.remaining_tokens = list(
+                            request.prompt_token_ids[cached_token_count:]
+                        )
+                        logger.info(
+                            f"[cache_fetch] request={request.request_id[:12]} HIT "
+                            f"prompt_tokens={len(request.prompt_token_ids)} "
+                            f"cached={cached_token_count} "
+                            f"remaining={len(request.remaining_tokens)} "
+                            f"match={result.match_type} "
+                            f"{'canonical' if request.canonical_token_ids else 'original'} "
+                            f"ssm={'present' if result.ssm_states else 'recompute'} "
+                            f"time={_fetch_dt:.3f}s"
+                        )
+                        # DEBUG: decode tokens around divergence point
+                        if cached_token_count < len(request.prompt_token_ids) - 1:
+                            try:
+                                ctx = 20
+                                start = max(0, cached_token_count - ctx)
+                                end = min(len(request.prompt_token_ids), cached_token_count + ctx)
+                                snippet_tokens = list(request.prompt_token_ids[start:end])
+                                decoded = self._decode_tokens(snippet_tokens)
+                                logger.debug(
+                                    f"[cache_diverge_debug] divergence at token {cached_token_count}, "
+                                    f"text around divergence (tokens {start}-{end}): "
+                                    f"{decoded!r}"
+                                )
+                            except Exception as e:
+                                logger.debug(f"[cache_diverge_debug] decode failed: {e}")
+                    else:
+                        request.cache_hit_type = "miss"
+                        request.remaining_tokens = request.prompt_token_ids
+                else:
+                    request.cache_hit_type = "miss"
+                    request.remaining_tokens = request.prompt_token_ids
+            else:
+                request.cache_hit_type = "miss"
+                request.remaining_tokens = request.prompt_token_ids
+                logger.info(
+                    f"[cache_fetch] request={request.request_id[:12]} MISS "
+                    f"prompt_tokens={len(request.prompt_token_ids)} "
+                    f"time={_fetch_dt:.3f}s"
+                )
+        elif self.block_aware_cache is not None:
             # Use paged cache
             block_table, remaining = self.block_aware_cache.fetch_cache(
                 request.request_id,
@@ -1576,15 +2126,35 @@ class Scheduler:
             _fetch_dt = _time.monotonic() - _fetch_t0
             request.cache_hit_type = self.memory_aware_cache._last_match_type
             if cache:
-                request.prompt_cache = cache
-                request.cached_tokens = len(request.prompt_token_ids) - len(remaining)
-                request.remaining_tokens = remaining
-                logger.info(
-                    f"[cache_fetch] request={request.request_id[:12]} HIT "
-                    f"prompt_tokens={len(request.prompt_token_ids)} "
-                    f"cached={request.cached_tokens} remaining={len(remaining)} "
-                    f"time={_fetch_dt:.3f}s"
+                cached_token_count = len(request.prompt_token_ids) - len(remaining)
+                # For hybrid models, check if this is a KV-only hit
+                # and set SSM recompute flags on the request.
+                cache = self._restore_hybrid_cache(
+                    cache, request, cached_token_count
                 )
+                if cache is None:
+                    # Hybrid restore failed, treat as miss
+                    request.cache_hit_type = "miss"
+                    request.remaining_tokens = request.prompt_token_ids
+                    logger.debug(
+                        f"[cache_fetch] request={request.request_id[:12]} "
+                        f"hybrid restore failed, treating as miss"
+                    )
+                else:
+                    request.prompt_cache = cache
+                    request.cached_tokens = cached_token_count
+                    request.remaining_tokens = remaining
+                    logger.info(
+                        f"[cache_fetch] request={request.request_id[:12]} HIT "
+                        f"prompt_tokens={len(request.prompt_token_ids)} "
+                        f"cached={request.cached_tokens} remaining={len(remaining)} "
+                        f"time={_fetch_dt:.3f}s"
+                        + (
+                            f" ssm_recompute_from={request._ssm_recompute_from}"
+                            if getattr(request, "_needs_ssm_recompute", False)
+                            else ""
+                        )
+                    )
             else:
                 request.remaining_tokens = request.prompt_token_ids
                 logger.info(
@@ -1760,6 +2330,15 @@ class Scheduler:
                 request.remaining_tokens = request.prompt_token_ids
                 tokens_to_process = request.prompt_token_ids
 
+            # Build per-request logits processors (e.g. repetition penalty)
+            req_logits_processors = None
+            rep_penalty = request.sampling_params.repetition_penalty
+            if rep_penalty is not None and rep_penalty != 1.0:
+                from mlx_lm.sample_utils import make_repetition_penalty
+                req_logits_processors = [
+                    [make_repetition_penalty(rep_penalty)]
+                ]
+
             # Insert into BatchGenerator with optional cache.
             # Wrap in try/except: if cache shapes are incompatible
             # (e.g. stale entry after BatchGenerator recreation),
@@ -1769,6 +2348,7 @@ class Scheduler:
                     [tokens_to_process],
                     max_tokens=[request.sampling_params.max_tokens],
                     caches=[cache_to_use] if cache_to_use else None,
+                    logits_processors=req_logits_processors,
                 )
             except Exception as e:
                 if cache_to_use is not None:
@@ -1785,6 +2365,7 @@ class Scheduler:
                         [tokens_to_process],
                         max_tokens=[request.sampling_params.max_tokens],
                         caches=None,
+                        logits_processors=req_logits_processors,
                     )
                 else:
                     raise
@@ -1924,7 +2505,41 @@ class Scheduler:
 
             # Store cache for future reuse
             if request is not None and request.prompt_token_ids:
-                if self.block_aware_cache is not None:
+                if self.hybrid_radix_cache is not None:
+                    if (
+                        hasattr(request, "_extracted_cache")
+                        and request._extracted_cache is not None
+                    ):
+                        try:
+                            # Use canonical tokens for cache key (prompt-only)
+                            prompt_key = tuple(
+                                request.canonical_token_ids or request.prompt_token_ids
+                            )
+                            kv_states, ssm_states = self._split_hybrid_states(
+                                request._extracted_cache
+                            )
+                            self.hybrid_radix_cache.insert(
+                                prompt_key, kv_states, ssm_states
+                            )
+                            stats = self.hybrid_radix_cache.get_stats()
+                            logger.info(
+                                f"[cache_store] request={request_id[:12]} "
+                                f"tokens={len(prompt_key)} "
+                                f"({'canonical' if request.canonical_token_ids else 'original'}) "
+                                f"(prompt-only key) "
+                                f"hot={stats['hot_entries']} cold={stats['cold_entries']} "
+                                f"mem={stats['total_memory_bytes'] / 1e6:.0f}MB"
+                            )
+                            logger.info(
+                                f"[cache_store_diag] stored first_30={list(prompt_key[:30])}"
+                            )
+                            request._extracted_cache = None
+                        except Exception as e:
+                            logger.debug(
+                                f"Failed to store hybrid cache for {request_id}: {e}"
+                            )
+
+                elif self.block_aware_cache is not None:
                     # Store in paged cache
                     # Key includes both prompt and output tokens for multi-turn chat caching
                     if (
@@ -2076,6 +2691,8 @@ class Scheduler:
         self._current_sampler_params = None
 
         # Clear caches
+        if self.hybrid_radix_cache is not None:
+            self.hybrid_radix_cache.clear()
         if self.block_aware_cache is not None:
             self.block_aware_cache.clear()
         if self.memory_aware_cache is not None:
@@ -2350,7 +2967,9 @@ class Scheduler:
             pass
 
         # Include cache stats
-        if self.block_aware_cache is not None:
+        if self.hybrid_radix_cache is not None:
+            stats["hybrid_radix_cache"] = self.hybrid_radix_cache.get_stats()
+        elif self.block_aware_cache is not None:
             stats["paged_cache"] = self.block_aware_cache.get_stats()
         elif self.memory_aware_cache is not None:
             stats["memory_aware_cache"] = self.memory_aware_cache.get_stats()
@@ -2360,7 +2979,9 @@ class Scheduler:
 
     def get_cache_stats(self) -> Optional[Dict[str, Any]]:
         """Get cache statistics."""
-        if self.block_aware_cache is not None:
+        if self.hybrid_radix_cache is not None:
+            return self.hybrid_radix_cache.get_stats()
+        elif self.block_aware_cache is not None:
             return self.block_aware_cache.get_stats()
         elif self.memory_aware_cache is not None:
             return self.memory_aware_cache.get_stats()
@@ -2387,6 +3008,8 @@ class Scheduler:
         self._current_sampler_params = None
 
         # Clear caches
+        if self.hybrid_radix_cache is not None:
+            self.hybrid_radix_cache.clear()
         if self.block_aware_cache is not None:
             self.block_aware_cache.clear()
         if self.memory_aware_cache is not None:

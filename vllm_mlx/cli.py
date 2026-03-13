@@ -139,6 +139,9 @@ def serve_command(args):
             use_paged_cache=args.use_paged_cache,
             paged_cache_block_size=args.paged_cache_block_size,
             max_cache_blocks=args.max_cache_blocks,
+            # Hybrid cache options
+            use_hybrid_cache=args.use_hybrid_cache,
+            hybrid_cache_memory_mb=getattr(args, "hybrid_cache_memory_mb", None),
             # Chunked prefill
             chunked_prefill_tokens=args.chunked_prefill_tokens,
             # MTP
@@ -158,7 +161,10 @@ def serve_command(args):
         if args.enable_mtp:
             print(f"MTP: enabled, draft_tokens={args.mtp_num_draft_tokens}")
         print(f"Stream interval: {args.stream_interval} tokens")
-        if args.use_paged_cache:
+        if args.use_hybrid_cache:
+            mem_info = f", limit={args.hybrid_cache_memory_mb}MB" if args.hybrid_cache_memory_mb else ""
+            print(f"Hybrid radix cache: MARCONI-inspired SSM admission/eviction{mem_info}")
+        elif args.use_paged_cache:
             print(
                 f"Paged cache: block_size={args.paged_cache_block_size}, max_blocks={args.max_cache_blocks}"
             )
@@ -226,6 +232,9 @@ def bench_command(args):
             use_paged_cache=args.use_paged_cache,
             paged_cache_block_size=args.paged_cache_block_size,
             max_cache_blocks=args.max_cache_blocks,
+            # Hybrid cache options
+            use_hybrid_cache=args.use_hybrid_cache,
+            hybrid_cache_memory_mb=getattr(args, "hybrid_cache_memory_mb", None),
             # KV cache quantization
             kv_cache_quantization=args.kv_cache_quantization,
             kv_cache_quantization_bits=args.kv_cache_quantization_bits,
@@ -699,6 +708,17 @@ Examples:
         default=1000,
         help="Maximum number of cache blocks (default: 1000)",
     )
+    serve_parser.add_argument(
+        "--use-hybrid-cache",
+        action="store_true",
+        help="Use MARCONI-inspired hybrid radix cache for attention+SSM models (e.g., Qwen3.5)",
+    )
+    serve_parser.add_argument(
+        "--hybrid-cache-memory-mb",
+        type=int,
+        default=None,
+        help="Memory limit for hybrid cache in MB (default: unlimited)",
+    )
     # Chunked prefill
     serve_parser.add_argument(
         "--chunked-prefill-tokens",
@@ -922,6 +942,17 @@ Examples:
         type=int,
         default=1000,
         help="Maximum number of cache blocks (default: 1000)",
+    )
+    bench_parser.add_argument(
+        "--use-hybrid-cache",
+        action="store_true",
+        help="Use MARCONI-inspired hybrid radix cache for attention+SSM models (e.g., Qwen3.5)",
+    )
+    bench_parser.add_argument(
+        "--hybrid-cache-memory-mb",
+        type=int,
+        default=None,
+        help="Memory limit for hybrid cache in MB (default: unlimited)",
     )
 
     # Detokenizer benchmark

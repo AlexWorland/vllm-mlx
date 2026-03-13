@@ -27,8 +27,9 @@ from __future__ import annotations
 import bisect
 import logging
 import math
+import time
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -137,6 +138,11 @@ def estimate_kv_cache_memory(cache: list[Any]) -> int:
                 total_bytes += _array_memory(keys_attr)
             if not callable(values_attr):
                 total_bytes += _array_memory(values_attr)
+        elif hasattr(layer_cache, "cache") and isinstance(layer_cache.cache, list):
+            # ArraysCache / MambaCache: .cache is a list of arrays
+            for arr in layer_cache.cache:
+                if arr is not None:
+                    total_bytes += _array_memory(arr)
 
     return total_bytes
 
@@ -165,6 +171,10 @@ class MemoryCacheConfig:
     kv_bits: int = 8
     kv_group_size: int = 64
     kv_min_quantize_tokens: int = 256
+    enable_hybrid_cache: bool = False
+    prefix_cache_alpha: float = 0.0
+    ssm_admission_threshold: int = 2
+    auto_tune_alpha: bool = True
 
     def __post_init__(self) -> None:
         if not 0.0 < self.max_memory_percent <= 1.0:
@@ -242,15 +252,38 @@ class _CacheEntry:
     tokens: tuple[int, ...]
     cache: list[Any]
     memory_bytes: int
+    has_ssm_states: bool = False
+    ssm_checkpoint_pos: int = 0
+    ssm_layer_indices: tuple[int, ...] = ()
+    last_access: float = field(default_factory=time.monotonic)
+    access_count: int = 0
+    flop_efficiency: float = 0.0
 
     @classmethod
     def create(cls, tokens: list[int], cache: list[Any]) -> _CacheEntry:
-        """Create a cache entry with memory estimation."""
+        """Create a cache entry with memory estimation and SSM detection."""
         memory = estimate_kv_cache_memory(cache)
+        # Detect SSM layers using classify_cache_layers
+        ssm_layer_indices: tuple[int, ...] = ()
+        has_ssm = False
+        try:
+            from .hybrid_cache_entry import classify_cache_layers
+
+            _kv_indices, ssm_indices = classify_cache_layers(cache)
+            if ssm_indices:
+                ssm_layer_indices = tuple(ssm_indices)
+                has_ssm = True
+        except ImportError:
+            pass
         return cls(
             tokens=tuple(tokens),
             cache=cache,
             memory_bytes=memory,
+            has_ssm_states=has_ssm,
+            ssm_checkpoint_pos=len(tokens) if has_ssm else 0,
+            ssm_layer_indices=ssm_layer_indices,
+            last_access=time.monotonic(),
+            access_count=1,
         )
 
 
@@ -440,6 +473,9 @@ class MemoryAwarePrefixCache:
         # Track the match type from the last fetch() call
         self._last_match_type: str | None = None
 
+        # Hybrid cache support
+        self._recency_window: float = 300.0  # 5 minute window for recency normalization
+
         logger.info(
             f"MemoryAwarePrefixCache initialized: "
             f"max_memory={self._max_memory / _BYTES_PER_MB:.1f}MB, "
@@ -476,6 +512,8 @@ class MemoryAwarePrefixCache:
         if tokens_key in self._entries:
             entry = self._entries[tokens_key]
             self._entries.move_to_end(tokens_key)
+            entry.last_access = time.monotonic()
+            entry.access_count += 1
             self._stats.hits += 1
             self._stats.tokens_saved += len(tokens)
             self._last_match_type = "exact"
@@ -544,10 +582,26 @@ class MemoryAwarePrefixCache:
             )
 
             if excess > 0 and has_non_trimmable:
-                logger.debug(
-                    "[cache_fetch] supersequence match skipped: "
-                    "non-trimmable cache layers (hybrid model)"
-                )
+                if self._config.enable_hybrid_cache:
+                    # Hybrid mode: return KV-only match, flag SSM recompute
+                    kv_only_cache = self._extract_kv_only(best_super.cache)
+                    if kv_only_cache:
+                        trimmed_kv = _trim_cache_offset(kv_only_cache, excess)
+                        self._entries.move_to_end(best_super.tokens)
+                        self._stats.hits += 1
+                        self._stats.tokens_saved += n_requested
+                        self._last_match_type = "supersequence_hybrid"
+                        trimmed_kv = (
+                            _dequantize_cache(trimmed_kv)
+                            if self._config.kv_quantize
+                            else trimmed_kv
+                        )
+                        return trimmed_kv, []
+                else:
+                    logger.debug(
+                        "[cache_fetch] supersequence match skipped: "
+                        "non-trimmable cache layers (hybrid model)"
+                    )
             elif excess > 0:
                 trimmed_cache = _trim_cache_offset(best_super.cache, excess)
                 self._entries.move_to_end(best_super.tokens)
@@ -652,11 +706,199 @@ class MemoryAwarePrefixCache:
                     else trimmed_cache
                 )
                 return trimmed_cache, remaining
+            elif self._config.enable_hybrid_cache:
+                # Hybrid mode: return KV-only LCP match
+                kv_only_cache = self._extract_kv_only(best_lcp_entry.cache)
+                if kv_only_cache:
+                    trimmed_kv = _trim_cache_offset(kv_only_cache, excess)
+                    self._entries.move_to_end(best_lcp_entry.tokens)
+                    self._stats.hits += 1
+                    self._stats.tokens_saved += best_lcp_length
+                    remaining = tokens[best_lcp_length:]
+                    logger.debug(
+                        f"[cache_fetch] LCP hybrid hit: shared={best_lcp_length} "
+                        f"trimmed={excess} remaining={len(remaining)}"
+                    )
+                    self._last_match_type = "lcp_hybrid"
+                    trimmed_kv = (
+                        _dequantize_cache(trimmed_kv)
+                        if self._config.kv_quantize
+                        else trimmed_kv
+                    )
+                    return trimmed_kv, remaining
 
         self._stats.misses += 1
         self._last_match_type = "miss"
 
         return None, tokens
+
+    def fetch_hybrid(
+        self, tokens: list[int]
+    ) -> tuple[list[Any] | None, list[int], dict | None]:
+        """Fetch with hybrid metadata (3-tuple return).
+
+        Wraps fetch() and adds hybrid cache metadata indicating whether
+        SSM recompute is needed.
+
+        Args:
+            tokens: Input token sequence.
+
+        Returns:
+            Tuple of (cache, remaining_tokens, hybrid_metadata):
+            - cache: Cached KV state if found, None otherwise
+            - remaining_tokens: Tokens that still need processing
+            - hybrid_metadata: Dict with SSM recompute info, or None
+        """
+        cache_out, remaining = self.fetch(tokens)
+        if cache_out is None:
+            return None, remaining, None
+
+        match_type = self._last_match_type or "miss"
+        is_hybrid_match = match_type.endswith("_hybrid")
+
+        metadata: dict | None = None
+        if is_hybrid_match:
+            # Determine SSM recompute position from the matched entry
+            tokens_key = tuple(tokens)
+            ssm_recompute_from = 0
+            if tokens_key in self._entries:
+                entry = self._entries[tokens_key]
+                ssm_recompute_from = entry.ssm_checkpoint_pos
+            metadata = {
+                "needs_ssm_recompute": True,
+                "ssm_recompute_from": ssm_recompute_from,
+                "match_type": match_type,
+            }
+        elif self._config.enable_hybrid_cache:
+            metadata = {
+                "needs_ssm_recompute": False,
+                "ssm_recompute_from": 0,
+                "match_type": match_type,
+            }
+
+        return cache_out, remaining, metadata
+
+    def _extract_kv_only(self, cache: list[Any]) -> list[Any]:
+        """Extract KV-only layers from a hybrid cache, replacing SSM with None.
+
+        Args:
+            cache: List of per-layer cache objects (mixed KV + SSM).
+
+        Returns:
+            New list with SSM layers replaced by None placeholders.
+        """
+        result: list[Any] = []
+        for layer_cache in cache:
+            if layer_cache is None:
+                result.append(None)
+                continue
+            # Check if trimmable (KV layer) or non-trimmable (SSM layer)
+            if hasattr(layer_cache, "is_trimmable"):
+                if layer_cache.is_trimmable():
+                    result.append(layer_cache)
+                else:
+                    result.append(None)  # SSM placeholder
+            elif hasattr(layer_cache, "offset") and hasattr(layer_cache, "keys"):
+                result.append(layer_cache)  # KV layer
+            elif hasattr(layer_cache, "cache") and isinstance(
+                getattr(layer_cache, "cache", None), list
+            ):
+                result.append(None)  # SSM layer placeholder
+            else:
+                result.append(layer_cache)
+        return result
+
+    def _strip_ssm_states(self, entry: _CacheEntry) -> _CacheEntry:
+        """Strip SSM states from an entry, keeping only KV layers.
+
+        Args:
+            entry: Cache entry with potentially mixed KV + SSM layers.
+
+        Returns:
+            New entry with SSM layers replaced by None.
+        """
+        kv_only = self._extract_kv_only(entry.cache)
+        new_memory = estimate_kv_cache_memory(kv_only)
+        return _CacheEntry(
+            tokens=entry.tokens,
+            cache=kv_only,
+            memory_bytes=new_memory,
+            has_ssm_states=False,
+            ssm_checkpoint_pos=0,
+            ssm_layer_indices=(),
+            last_access=entry.last_access,
+            access_count=entry.access_count,
+            flop_efficiency=entry.flop_efficiency,
+        )
+
+    def _should_admit_ssm(
+        self, tokens_key: tuple[int, ...], entry: _CacheEntry
+    ) -> bool:
+        """Check judicious admission policy for SSM states.
+
+        SSM states have ~65x lower reuse rate than KV states, so we only
+        admit them on repeated access.
+
+        Args:
+            tokens_key: Token sequence key.
+            entry: The cache entry being stored.
+
+        Returns:
+            True if SSM states should be stored.
+        """
+        threshold = self._config.ssm_admission_threshold
+        # Check if this prefix has been accessed before
+        if tokens_key in self._entries:
+            existing = self._entries[tokens_key]
+            if existing.access_count >= threshold:
+                return True
+        # First time: reject SSM states (store KV only)
+        return False
+
+    def _evict_flop_aware(self) -> None:
+        """Evict entry with lowest utility score: recency + alpha * flop_efficiency."""
+        if not self._entries:
+            return
+
+        now = time.monotonic()
+        min_score = float("inf")
+        min_key: tuple[int, ...] | None = None
+
+        for key, entry in self._entries.items():
+            recency = 1.0 - min(
+                (now - entry.last_access) / self._recency_window, 1.0
+            )
+            score = recency + self._config.prefix_cache_alpha * entry.flop_efficiency
+            if score < min_score:
+                min_score = score
+                min_key = key
+
+        if min_key is not None:
+            entry = self._entries[min_key]
+            # Demote SSM states first if present (larger, lower reuse)
+            if entry.has_ssm_states:
+                stripped = self._strip_ssm_states(entry)
+                freed = entry.memory_bytes - stripped.memory_bytes
+                self._entries[min_key] = stripped
+                self._current_memory -= freed
+                self._stats.evictions += 1
+                self._stats.current_memory_bytes = self._current_memory
+                logger.debug(
+                    f"[flop_evict] demoted SSM states for {len(min_key)} tokens, "
+                    f"freed {freed / _BYTES_PER_MB:.2f}MB"
+                )
+            else:
+                # Evict entire entry
+                old = self._entries.pop(min_key)
+                self._current_memory -= old.memory_bytes
+                self._remove_from_sorted(min_key)
+                self._stats.evictions += 1
+                self._stats.entry_count = len(self._entries)
+                self._stats.current_memory_bytes = self._current_memory
+                logger.debug(
+                    f"[flop_evict] removed {len(min_key)} tokens, "
+                    f"freed {old.memory_bytes / _BYTES_PER_MB:.2f}MB"
+                )
 
     def store(
         self, tokens: list[int], cache: list[Any], evict_prefixes: bool = True
@@ -705,6 +947,18 @@ class MemoryAwarePrefixCache:
         # Create entry and estimate memory
         entry = _CacheEntry.create(tokens, cache)
 
+        # Judicious SSM admission: strip SSM states on first access
+        if (
+            self._config.enable_hybrid_cache
+            and entry.has_ssm_states
+            and not self._should_admit_ssm(tokens_key, entry)
+        ):
+            entry = self._strip_ssm_states(entry)
+            logger.debug(
+                f"[ssm_admit] rejected SSM states for {len(tokens)} tokens "
+                f"(access_count below threshold)"
+            )
+
         # Check if single entry exceeds limit
         if entry.memory_bytes > self._max_memory:
             logger.warning(
@@ -744,11 +998,18 @@ class MemoryAwarePrefixCache:
                 self._stats.current_memory_bytes = self._current_memory
 
         # Evict until we have room
+        use_flop_eviction = (
+            self._config.enable_hybrid_cache
+            and self._config.prefix_cache_alpha > 0
+        )
         while (
             self._current_memory + entry.memory_bytes > self._max_memory
             or len(self._entries) >= self._config.max_entries
         ) and self._entries:
-            self._evict_lru()
+            if use_flop_eviction:
+                self._evict_flop_aware()
+            else:
+                self._evict_lru()
 
         # Store entry
         self._entries[tokens_key] = entry

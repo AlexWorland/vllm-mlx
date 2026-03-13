@@ -481,11 +481,14 @@ class BatchedEngine(BaseEngine):
             temperature=temperature,
             top_p=top_p,
             stop=stop or [],
+            repetition_penalty=kwargs.get("repetition_penalty", 1.0),
         )
 
+        prefix_boundary = kwargs.pop("prefix_boundary", 0)
         output = await self._engine.generate(
             prompt=prompt,
             sampling_params=sampling_params,
+            prefix_boundary=prefix_boundary,
         )
 
         text = clean_output_text(output.output_text)
@@ -557,6 +560,7 @@ class BatchedEngine(BaseEngine):
             temperature=temperature,
             top_p=top_p,
             stop=stop or [],
+            repetition_penalty=kwargs.get("repetition_penalty", 1.0),
         )
 
         prefix_boundary = kwargs.pop("prefix_boundary", 0)
@@ -627,6 +631,11 @@ class BatchedEngine(BaseEngine):
             template_tools,
             num_images=len(all_images),
         )
+
+        # Compute prefix boundary for cache
+        prefix_boundary = self._compute_prefix_boundary(messages, tools)
+        if prefix_boundary > 0:
+            kwargs["prefix_boundary"] = prefix_boundary
 
         return await self.generate(
             prompt=prompt,
