@@ -299,7 +299,7 @@ _reasoning_parser = None  # ReasoningParser instance when enabled
 # Tool calling configuration
 _enable_auto_tool_choice: bool = False
 _tool_call_parser: str | None = None  # Parser name: auto, mistral, qwen, llama, hermes
-_tool_parser_instance = None  # Instantiated parser
+_tool_parser_class = None  # Resolved parser class (shared); instances are per-request
 _system_prompt_prefix: str | None = None  # Prepended to every system message
 
 
@@ -495,7 +495,7 @@ def _parse_tool_calls_with_parser(
     Returns:
         Tuple of (cleaned_text, tool_calls)
     """
-    global _tool_parser_instance
+    global _tool_parser_class
 
     request_dict = request.model_dump() if request else None
 
@@ -503,28 +503,27 @@ def _parse_tool_calls_with_parser(
     if not _enable_auto_tool_choice or not _tool_call_parser:
         return parse_tool_calls(output_text, request_dict)
 
-    # Initialize parser if needed
-    if _tool_parser_instance is None:
+    # Resolve the parser class once (class is safe to share; instances are not)
+    if _tool_parser_class is None:
         try:
-            parser_cls = ToolParserManager.get_tool_parser(_tool_call_parser)
-            # Get tokenizer from engine if available
-            tokenizer = None
-            if _engine is not None and hasattr(_engine, "_tokenizer"):
-                tokenizer = _engine._tokenizer
-            _tool_parser_instance = parser_cls(tokenizer)
-            logger.info(f"Initialized tool call parser: {_tool_call_parser}")
+            _tool_parser_class = ToolParserManager.get_tool_parser(_tool_call_parser)
+            logger.info(f"Resolved tool call parser class: {_tool_call_parser}")
         except Exception as e:
             logger.warning(
-                f"Failed to initialize tool parser '{_tool_call_parser}': {e}"
+                f"Failed to resolve tool parser '{_tool_call_parser}': {e}"
             )
             logger.warning("Falling back to generic parser")
             return parse_tool_calls(output_text, request_dict)
 
+    # Instantiate a fresh parser per call (avoids shared state between requests)
+    tokenizer = None
+    if _engine is not None and hasattr(_engine, "_tokenizer"):
+        tokenizer = _engine._tokenizer
+    parser_instance = _tool_parser_class(tokenizer)
+
     # Use the configured parser
     try:
-        # Reset parser state between requests
-        _tool_parser_instance.reset()
-        result = _tool_parser_instance.extract_tool_calls(output_text, request_dict)
+        result = parser_instance.extract_tool_calls(output_text, request_dict)
         if result.tools_called:
             tool_calls = [
                 ToolCall(
@@ -623,12 +622,12 @@ def load_model(
         max_tokens: Default max tokens for generation
         force_mllm: Force loading as MLLM even if not auto-detected
     """
-    global _engine, _model_name, _default_max_tokens, _tool_parser_instance
+    global _engine, _model_name, _default_max_tokens, _tool_parser_class
 
     _default_max_tokens = max_tokens
     _model_name = model_name
-    # Reset tool parser instance when model is reloaded (tokenizer may change)
-    _tool_parser_instance = None
+    # Reset cached parser class when model is reloaded (tokenizer may change)
+    _tool_parser_class = None
 
     if force_mllm:
         logger.info("Force MLLM mode enabled via --mllm flag")
@@ -2211,27 +2210,30 @@ async def stream_chat_completion(
     last_output = None
     first_token_time = None
 
-    # Tool call streaming state
-    global _tool_parser_instance
+    # Tool call streaming state — instantiate a fresh parser per request so that
+    # concurrent streaming coroutines (e.g. OpenCode's tab-agent + main-agent) never
+    # share mutable accumulation state and cause XML to leak into content output.
+    global _tool_parser_class
     tool_parser = None
     tool_accumulated_text = ""
     tool_calls_detected = False
     tool_markup_possible = False  # Fast path: skip parsing until '<' seen
     if _enable_auto_tool_choice and _tool_call_parser:
-        # Initialize parser if needed (same as _parse_tool_calls_with_parser)
-        if _tool_parser_instance is None:
+        # Resolve class once (shared); instantiate fresh object per request
+        if _tool_parser_class is None:
             try:
-                parser_cls = ToolParserManager.get_tool_parser(_tool_call_parser)
+                _tool_parser_class = ToolParserManager.get_tool_parser(_tool_call_parser)
+                logger.info(f"Resolved tool call parser class: {_tool_call_parser}")
+            except Exception as e:
+                logger.warning(f"Failed to resolve tool parser for streaming: {e}")
+        if _tool_parser_class is not None:
+            try:
                 tokenizer = None
                 if _engine is not None and hasattr(_engine, "_tokenizer"):
                     tokenizer = _engine._tokenizer
-                _tool_parser_instance = parser_cls(tokenizer)
-                logger.info(f"Initialized tool call parser: {_tool_call_parser}")
+                tool_parser = _tool_parser_class(tokenizer)
             except Exception as e:
-                logger.warning(f"Failed to init tool parser for streaming: {e}")
-        if _tool_parser_instance is not None:
-            tool_parser = _tool_parser_instance
-            tool_parser.reset()
+                logger.warning(f"Failed to instantiate tool parser for streaming: {e}")
 
     # Stream content
     async for output in engine.stream_chat(messages=messages, **kwargs):
